@@ -6,8 +6,6 @@
 
 use std::fmt;
 
-use crate::Result;
-
 /// All file formats we recognise by magic bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Magic {
@@ -201,6 +199,22 @@ const fn is_text_byte(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    // Helper: build an RIFF/WAVE-style blob of 12 bytes with the given
+    // 4-byte type at offset 8..12.
+    fn make_riff(kind: &[u8; 4]) -> Vec<u8> {
+        let mut buf = vec![0u8; 12];
+        buf[..4].copy_from_slice(b"RIFF");
+        buf[8..12].copy_from_slice(kind);
+        buf
+    }
+
+    // Helper: build an ISO BMFF blob with `ftyp` at offset 4..8.
+    fn make_ftyp() -> Vec<u8> {
+        let mut buf = vec![0u8; 12];
+        buf[4..8].copy_from_slice(b"ftyp");
+        buf
+    }
+
     #[test]
     fn detects_empty() {
         assert_eq!(detect(&[]), Magic::Empty);
@@ -215,29 +229,68 @@ mod tests {
     }
 
     #[test]
+    fn detects_png_truncated() {
+        // Bytes 0..7 missing the final byte — should NOT match PNG.
+        let bytes = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A];
+        assert_eq!(detect(&bytes), Magic::Unknown);
+    }
+
+    #[test]
     fn detects_jpeg() {
         assert_eq!(detect(&[0xFF, 0xD8, 0xFF, 0xE0]), Magic::Jpeg);
     }
 
     #[test]
-    fn detects_gif89a() {
+    fn detects_gif87a_and_89a() {
+        assert_eq!(detect(b"GIF87a"), Magic::Gif);
         assert_eq!(detect(b"GIF89a"), Magic::Gif);
     }
 
     #[test]
-    fn detects_webp_full() {
-        let mut buf = [0u8; 12];
-        buf[..4].copy_from_slice(b"RIFF");
-        buf[8..12].copy_from_slice(b"WEBP");
-        assert_eq!(detect(&buf), Magic::WebP);
+    fn detects_webp() {
+        assert_eq!(detect(&make_riff(b"WEBP")), Magic::WebP);
     }
 
     #[test]
-    fn detects_wav_full() {
-        let mut buf = [0u8; 12];
-        buf[..4].copy_from_slice(b"RIFF");
-        buf[8..12].copy_from_slice(b"WAVE");
-        assert_eq!(detect(&buf), Magic::Wav);
+    fn detects_bmp() {
+        assert_eq!(detect(b"BM\x00\x00\x00\x00"), Magic::Bmp);
+    }
+
+    #[test]
+    fn detects_ogg() {
+        assert_eq!(detect(b"OggS\x00\x02"), Magic::Ogg);
+    }
+
+    #[test]
+    fn detects_wav() {
+        assert_eq!(detect(&make_riff(b"WAVE")), Magic::Wav);
+    }
+
+    #[test]
+    fn detects_flac() {
+        assert_eq!(detect(b"fLaC\x00\x00\x00\x22"), Magic::Flac);
+    }
+
+    #[test]
+    fn detects_iso_bmff() {
+        assert_eq!(detect(&make_ftyp()), Magic::IsoBmff);
+    }
+
+    #[test]
+    fn detects_matroska() {
+        assert_eq!(detect(&[0x1A, 0x45, 0xDF, 0xA3, 0x42, 0x86]), Magic::Matroska);
+    }
+
+    #[test]
+    fn detects_mp3_with_id3v2_tag() {
+        assert_eq!(detect(b"ID3\x04\x00\x00"), Magic::Mp3Id3);
+    }
+
+    #[test]
+    fn detects_mp3_frame_sync() {
+        // 0xFF 0xFB (MPEG 1 layer 3) — sync word frame header
+        let bytes = [0xFF, 0xFB, 0x90, 0x00];
+        assert_eq!(detect(&bytes), Magic::Mp3Frame);
     }
 
     #[test]
@@ -246,32 +299,64 @@ mod tests {
     }
 
     #[test]
-    fn detects_text() {
+    fn detects_text_short_printable_ascii() {
         assert_eq!(detect(b"label start:\n    pass\n"), Magic::Text);
     }
 
     #[test]
-    fn rejects_nul_text() {
-        assert_eq!(
-            detect(&[0x48, 0x00, 0x65, 0x6C]),
-            Magic::Unknown
-        );
+    fn rejects_text_with_nul() {
+        // NUL byte disqualifies text classification.
+        assert_eq!(detect(&[0x48, 0x00, 0x65, 0x6C]), Magic::Unknown);
     }
 
     #[test]
-    fn detects_iso_bmff() {
-        let mut buf = [0u8; 12];
-        buf[4..8].copy_from_slice(b"ftyp");
-        assert_eq!(detect(&buf), Magic::IsoBmff);
-    }
-
-    #[test]
-    fn detects_matroska() {
-        assert_eq!(detect(&[0x1A, 0x45, 0xDF, 0xA3]), Magic::Matroska);
+    fn rejects_text_over_long_limit() {
+        // Text detection is conservative: only short samples.
+        let big: Vec<u8> = b"a".repeat(100);
+        assert_eq!(detect(&big), Magic::Unknown);
     }
 
     #[test]
     fn extension_hint_classifies_rpyc() {
         assert_eq!(detect_with_ext(&[0, 1, 2, 3, 4], Some("rpyc")), Magic::Rpyc);
+        assert_eq!(detect_with_ext(&[0, 1, 2, 3, 4], Some("rpy")), Magic::Text);
+        assert_eq!(detect_with_ext(&[0, 1, 2, 3, 4], Some("py")), Magic::Text);
+    }
+
+    #[test]
+    fn extension_hint_falls_back_when_magic_known() {
+        // Magic detection wins over extension hint.
+        let png_sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(detect_with_ext(&png_sig, Some("rpyc")), Magic::Png);
+    }
+
+    #[test]
+    fn label_strings_match_classification() {
+        // Each `label()` value should match the variant it came from.
+        // This catches the `Display` impl collapsing distinct labels.
+        for m in [
+            Magic::Empty,
+            Magic::Png,
+            Magic::Jpeg,
+            Magic::Gif,
+            Magic::WebP,
+            Magic::Bmp,
+            Magic::Ogg,
+            Magic::Wav,
+            Magic::Flac,
+            Magic::IsoBmff,
+            Magic::Matroska,
+            Magic::Mp3Id3,
+            Magic::Mp3Frame,
+            Magic::Rpyc,
+            Magic::Rpa3,
+            Magic::Text,
+            Magic::Unknown,
+        ] {
+            // Each label must be non-empty and stable.
+            assert!(!m.label().is_empty(), "label is empty for {:?}", m);
+            // Display matches `label`.
+            assert_eq!(m.to_string(), m.label());
+        }
     }
 }

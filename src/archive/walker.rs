@@ -164,6 +164,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_game_dir_uses_root_when_no_game_subdir() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        sfs::write(root.join("a.rpy"), b"#").unwrap();
+        let resolved = resolve_game_dir(root);
+        assert_eq!(resolved, root.to_path_buf());
+    }
+
+    #[test]
     fn walker_iterates_files() {
         let td = tempdir().unwrap();
         let root = td.path();
@@ -185,14 +194,61 @@ mod tests {
     }
 
     #[test]
-    fn walker_skips_hidden() {
+    fn walker_walks_deep_nested_and_totals_bytes() {
         let td = tempdir().unwrap();
         let root = td.path();
-        sfs::create_dir(root.join(".git")).unwrap();
-        sfs::write(root.join(".git").join("HEAD"), b"ref: heads/main").unwrap();
-        sfs::write(root.join("visible.txt"), b"hi").unwrap();
+        // Depth-7 nesting.
+        std::fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
+        let bodies = [
+            ("a/b/c/d/e/f.txt", 7usize),
+            ("a/b/c/d/g.txt", 11usize),
+            ("top.txt", 3usize),
+        ];
+        let mut expected_total = 0u64;
+        for (path, size) in bodies {
+            std::fs::write(root.join(path), vec![b'x'; size]).unwrap();
+            expected_total += size as u64;
+        }
+        let inv = GameWalker::new(root.to_path_buf()).walk().unwrap();
+        assert_eq!(inv.files.len(), 3, "three visible files");
+        assert_eq!(inv.total_bytes, expected_total);
+        // Relative-path components: must walk through the parent dirs
+        // serially, no orphans.
+        for f in &inv.files {
+            let parts: Vec<String> = f
+                .rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_owned()))
+                .collect();
+            // First is just the basename.
+            assert!(parts.iter().all(|p| !p.is_empty()));
+            assert!(!parts.contains(&"..".to_string()));
+        }
+    }
+
+    #[test]
+    fn walker_skips_hidden_and_named_skip_dirs() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), b"x").unwrap();
+        std::fs::create_dir(root.join("__pycache__")).unwrap();
+        std::fs::write(root.join("__pycache__").join("a.pyc"), b"x").unwrap();
+        std::fs::write(root.join(".hidden.txt"), b"x").unwrap();
+        std::fs::write(root.join("visible.txt"), b"x").unwrap();
         let inv = GameWalker::new(root.to_path_buf()).walk().unwrap();
         assert_eq!(inv.files.len(), 1);
         assert_eq!(inv.files[0].rel.to_string_lossy(), "visible.txt");
+    }
+
+    #[test]
+    fn walker_total_bytes_aggregates() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join("b"), vec![0u8; 250]).unwrap();
+        std::fs::write(root.join("c"), vec![0u8; 75]).unwrap();
+        let inv = GameWalker::new(root.to_path_buf()).walk().unwrap();
+        assert_eq!(inv.total_bytes, 425);
     }
 }

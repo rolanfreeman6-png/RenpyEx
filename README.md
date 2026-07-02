@@ -76,11 +76,15 @@ magic → 16-hex offset → key → zlib-compressed pickled index).
 
 ## Quality
 
-- 42 unit tests + 5 mutation tests, all green on the standard `cargo test`
+- 60 unit tests + 1 CLI smoke test + 5 mutation tests, all green on
+  the standard `cargo test`. Total: **66 tests, 0 failures**.
 - Release build under **20s** on a multi-core machine; static release
   binary, no runtime dependencies except optional Python for `.rpyc`
   decompile and a real Ren'Py archive `Python` helper for archival
   unpickling.
+- `cargo build --release` produces zero compiler warnings under the
+  `correctness = deny`, `style = warn`, `suspicious = warn` clippy lint
+  set declared in `Cargo.toml`.
 
 ## Type design (the "illegal states unrepresentable" rule)
 

@@ -209,6 +209,32 @@ mod tests {
     }
 
     #[test]
+    fn emit_sums_orders_by_path_alphabetically() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("z.txt"), b"z").unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("m.txt"), b"m").unwrap();
+        let sums = root.join("SHA256SUMS.txt");
+        emit_sums(root, &sums).unwrap();
+        let text = std::fs::read_to_string(&sums).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // First line should reference 'a', last should reference 'z'.
+        assert!(lines[0].ends_with("a.txt"));
+        assert!(lines[2].ends_with("z.txt"));
+    }
+
+    #[test]
+    fn emit_sums_handles_empty_directory() {
+        let td = tempdir().unwrap();
+        let sums = td.path().join("SHA256SUMS.txt");
+        emit_sums(td.path(), &sums).unwrap();
+        let entries = read_sums(&sums).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
     fn detect_mutation() {
         let td = tempdir().unwrap();
         let root = td.path();
@@ -220,5 +246,29 @@ mod tests {
         assert_eq!(ok, 0);
         assert_eq!(bad.len(), 1);
         assert!(matches!(bad[0], VerifyOutcome::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_one_returns_missing_for_empty_path() {
+        let td = tempdir().unwrap();
+        let outcome = verify_one(td.path(), Path::new("ghost.txt"), &[0u8; 32]).unwrap();
+        assert!(matches!(outcome, VerifyOutcome::Missing { .. }));
+    }
+
+    #[test]
+    fn parse_sums_recognises_star_separator() {
+        // gnu coreutils emits "<hex> *<path>" — `*` is an asterisk marker.
+        let text = "0000000000000000000000000000000000000000000000000000000000000000 *sample.txt\n";
+        let entries = parse_sums(text).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, PathBuf::from("sample.txt"));
+    }
+
+    #[test]
+    fn parse_sums_empty_input_is_zero_entries() {
+        let entries = parse_sums("").unwrap();
+        assert!(entries.is_empty());
+        let entries = parse_sums("# only comments\n# ...\n").unwrap();
+        assert!(entries.is_empty());
     }
 }
