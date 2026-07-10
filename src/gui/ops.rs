@@ -126,11 +126,11 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
                 continue;
             }
         };
-        if let Some(parent) = dest.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                failures.push(format!("{}: {err}", file.rel.display()));
-                continue;
-            }
+        if let Some(parent) = dest.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            failures.push(format!("{}: {err}", file.rel.display()));
+            continue;
         }
         if let Err(e) = std::fs::copy(&file.abs, &dest) {
             failures.push(format!("{}: {e}", file.rel.display()));
@@ -147,11 +147,11 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
                 let dest = output
                     .join("rpa")
                     .join(path.file_name().unwrap_or_default());
-                if let Some(parent) = dest.parent() {
-                    if let Err(err) = std::fs::create_dir_all(parent) {
-                        failures.push(format!("rpa {}: {err}", path.display()));
-                        continue;
-                    }
+                if let Some(parent) = dest.parent()
+                    && let Err(err) = std::fs::create_dir_all(parent)
+                {
+                    failures.push(format!("rpa {}: {err}", path.display()));
+                    continue;
                 }
                 match extract_rpa(&path, &dest, parsed_key) {
                     Ok(listed) => {

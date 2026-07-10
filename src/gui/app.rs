@@ -440,9 +440,9 @@ impl RenpyExApp {
         }
 
         // Double border painted on top so it frames the art crisply.
-        painter.rect_stroke(rect, outer_r, egui::Stroke::new(2.0, theme::BORDER));
+        painter.rect_stroke(rect, outer_r, egui::Stroke::new(2.0_f32, theme::BORDER));
         let inner = rect.shrink(4.0);
-        painter.rect_stroke(inner, egui::Rounding::same(4.0), egui::Stroke::new(1.0, theme::ACCENT));
+        painter.rect_stroke(inner, egui::Rounding::same(4.0), egui::Stroke::new(1.0_f32, theme::ACCENT));
     }
 }
 

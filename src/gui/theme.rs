@@ -45,7 +45,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.faint_bg_color = PANEL_HI;
     visuals.override_text_color = Some(FG);
     visuals.window_rounding = egui::Rounding::same(6.0);
-    visuals.window_stroke = egui::Stroke::new(1.0, BORDER);
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
 
     for widgets in [
         &mut visuals.widgets.noninteractive,
@@ -61,7 +61,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.inactive.weak_bg_fill = PANEL_HI;
     visuals.widgets.hovered.bg_fill = PANEL_HI;
     visuals.widgets.active.bg_fill = PANEL_HI;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
 
     ctx.set_visuals(visuals);
 
@@ -73,11 +73,10 @@ pub fn apply(ctx: &egui::Context) {
 
 /// Frame for the central log pane: transparent-tinted background with a
 /// crisp border, matching the retro double-frame look.
-#[must_use]
 pub fn screen_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(BG)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .rounding(egui::Rounding::same(4.0))
         .inner_margin(egui::Margin::same(6.0))
 }
@@ -147,19 +146,19 @@ pub fn steel_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
             rect.left_top() + egui::vec2(2.0, 1.0),
             rect.right_top() + egui::vec2(-2.0, 1.0),
         ],
-        egui::Stroke::new(1.0, top_edge),
+        egui::Stroke::new(1.0_f32, top_edge),
     );
     painter.line_segment(
         [
             rect.left_bottom() + egui::vec2(2.0, -1.0),
             rect.right_bottom() + egui::vec2(-2.0, -1.0),
         ],
-        egui::Stroke::new(1.0, bottom_edge),
+        egui::Stroke::new(1.0_f32, bottom_edge),
     );
     painter.rect_stroke(
         rect,
         rounding,
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(92, 98, 108)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(92, 98, 108)),
     );
 
     let text_offset = if pressed { egui::vec2(0.0, 1.0) } else { egui::Vec2::ZERO };
