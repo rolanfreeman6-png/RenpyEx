@@ -16,6 +16,8 @@ pub mod archive;
 pub mod cli;
 pub mod convert;
 pub mod error;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod key;
 pub mod output;
 pub mod test_fixtures;

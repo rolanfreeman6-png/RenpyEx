@@ -63,6 +63,56 @@ cargo build --release
 # binary at target/release/renpyex(.exe)
 ```
 
+## GUI
+
+A native desktop front-end is available behind the optional `gui` feature. It
+is a thin egui/eframe layer over the same library API the CLI uses — the core
+extraction/verification/conversion code is unchanged and stays the single
+source of truth.
+
+```bash
+# build the GUI binary (pulls the egui/glow stack; off by default)
+cargo build --release --features gui --bin renpyex-gui
+# binary at target/release/renpyex-gui(.exe)
+
+# headless runtime smoke (no window; for CI on displayless machines)
+renpyex-gui --probe
+```
+
+- Backend: `eframe` with the `glow` (OpenGL) renderer for portability.
+- Layout: left panel with a framed character portrait on top of the
+  source/output paths and operation settings, central log pane, top toolbar
+  (Scan / Extract / Verify / Convert), bottom status bar reporting state and
+  Python/`unrpyc` availability.
+- Long-running operations run on a background thread (`std::thread` + `mpsc`,
+  no async); the toolbar is disabled while a job is in flight.
+- The last-used source and output paths persist to
+  `%APPDATA%\renpyex\config.json` (Windows) or
+  `$XDG_CONFIG_HOME/renpyex/config.json` (Linux/macOS).
+
+**Theme:** a retro 16-bit console-RPG palette — deep royal-blue panels, gold
+section headings, light-periwinkle borders — made **fully transparent**: the
+window itself has no opaque backdrop (`ViewportBuilder::with_transparent` +
+a `clear_color` override so the glow-rendered frame buffer clears to zero
+alpha), and every panel fill is a semi-transparent tint of the palette so the
+desktop shows through behind the UI. The palette and frames live in
+`src/gui/theme.rs`. Toolbar and path-picker buttons (`Scan` / `Extract` /
+`Verify` / `Convert` / `Browse…`) use a hand-painted **steel, semi-glossy,
+slightly convex** button style (`theme::steel_button`) — egui's flat
+`Visuals` styling has no gradient/bevel primitive, so the glossy highlight
+band and embossed edge strokes are painted manually, flattening and
+darkening while pressed so the button reads as pushed in. Log lines are
+subtly color-coded on their key markers only: green for success
+(`Extracted` / `Copied` / `Converted` / `Done` / `Verified`), salmon for
+failures (`ERROR` / `MISMATCH` / `MISSING` / `*fail*`), gold for headers, and
+muted for skipped entries. The top-left frame holds a character portrait
+(`src/gui/assets/portrait.png`, downscaled to 384×640 and embedded in the
+binary via `include_bytes!`), aspect-fit inside the double border.
+
+The default `cargo build` / `cargo test` do **not** compile the GUI stack, so
+the core CLI stays lean. GUI logic is covered by `tests/gui_smoke.rs`
+(feature-gated) plus unit tests in `src/gui/`.
+
 ## Install (in-tree Python fixture for tests)
 
 ```bash
