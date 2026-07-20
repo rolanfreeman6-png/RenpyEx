@@ -195,7 +195,7 @@ mod tests {
         let td = tempdir().unwrap();
         let root = td.path();
         std::fs::write(root.join("a.txt"), b"hello").unwrap();
-        std::fs::write(root.join("b.bin"), &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        std::fs::write(root.join("b.bin"), [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
         let sums = root.join("SHA256SUMS.txt");
         emit_sums(root, &sums).unwrap();

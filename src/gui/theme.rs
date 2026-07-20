@@ -1,25 +1,25 @@
 //! Visual theme: a retro 16-bit console-RPG palette (deep royal-blue panels,
-//! gold headings, light-periwinkle borders) made **fully transparent** so the
-//! desktop shows through behind the window, plus a hand-painted steel,
-//! semi-glossy, slightly convex button style.
+//! gold headings, light-periwinkle borders). The overlay's see-through look
+//! is NOT done here: per-pixel GPU alpha never composites against the
+//! desktop on Windows (broken in both the glow and wgpu eframe backends), so
+//! the panels are opaque and the whole window is made uniformly translucent
+//! at the OS level instead (`WS_EX_LAYERED` + `LWA_ALPHA` in
+//! `src/bin/gui.rs`). Plus a hand-painted steel, semi-glossy, slightly
+//! convex button style.
 //!
 //! egui's `Visuals` system has no gradient or bevel primitives, so the
 //! convex/glossy button look ([`steel_button`]) is painted manually rather
 //! than expressed as a style tweak.
 
-/// Deepest background tone (log pane, central panel base) — semi-transparent
-/// navy so the desktop is visible behind it.
-///
-/// `Color32` stores premultiplied alpha, so these are the straight color
-/// `(8, 11, 28)` at alpha `150/255` pre-multiplied by hand (`channel *
-/// alpha / 255`), not the straight values themselves.
-pub const BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(5, 6, 16, 150);
+/// Deepest background tone (log pane, central panel base). Opaque — the
+/// desktop shows through via the OS-level window alpha, not per-pixel alpha.
+pub const BG: egui::Color32 = egui::Color32::from_rgb(8, 11, 28);
 /// Panel fill (side panel, top/bottom bars) — slightly lighter than [`BG`].
-/// Premultiplied form of straight color `(15, 20, 48)` at alpha `150/255`.
-pub const PANEL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 12, 28, 150);
-/// Highlight fill for framed inner elements (e.g. the portrait slot).
-/// Premultiplied form of straight color `(24, 31, 64)` at alpha `165/255`.
-pub const PANEL_HI: egui::Color32 = egui::Color32::from_rgba_premultiplied(16, 20, 41, 165);
+pub const PANEL: egui::Color32 = egui::Color32::from_rgb(15, 20, 48);
+/// Highlight fill for interactive controls and framed inner elements (text
+/// fields, popups, the portrait slot fallback) — slightly lighter than the
+/// panels.
+pub const PANEL_HI: egui::Color32 = egui::Color32::from_rgb(24, 31, 64);
 /// Border stroke color (light periwinkle), kept opaque so frames stay crisp.
 pub const BORDER: egui::Color32 = egui::Color32::from_rgb(184, 180, 235);
 /// Accent color for headings and the title (retro gold).
@@ -71,8 +71,8 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Frame for the central log pane: transparent-tinted background with a
-/// crisp border, matching the retro double-frame look.
+/// Frame for the central log pane: navy fill with a crisp
+/// border, matching the retro double-frame look.
 pub fn screen_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(BG)

@@ -553,7 +553,6 @@ fn ascii_lossy(bytes: &[u8]) -> String {
 }
 
 /// Compute SHA-256 of a single entry's bytes (used by CLI to report).
-#[must_use]
 pub fn entry_sha256(archive: &Path, entry: &RpaEntry) -> Result<[u8; 32]> {
     let bytes = read_entry(archive, entry)?;
     Ok(sha256(&bytes))

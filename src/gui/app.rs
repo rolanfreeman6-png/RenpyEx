@@ -229,12 +229,12 @@ fn run_job(
 }
 
 impl eframe::App for RenpyExApp {
-    /// Clear the frame buffer with zero alpha instead of `Visuals::window_fill`
-    /// so the glow backend actually renders a transparent window (paired with
-    /// `ViewportBuilder::with_transparent(true)` in `src/bin/gui.rs`) — panels
-    /// still draw their own semi-transparent fills on top via `theme::apply`.
+    /// Clear the frame buffer to the theme's base navy. The overlay's
+    /// see-through look comes from OS-level whole-window alpha
+    /// (`WS_EX_LAYERED` in `src/bin/gui.rs`), not per-pixel GPU alpha — the
+    /// latter never composites against the desktop on Windows.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::TRANSPARENT.to_array()
+        egui::Rgba::from(theme::BG).to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -243,6 +243,29 @@ impl eframe::App for RenpyExApp {
         let busy = self.running.is_some();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            // The window is borderless (`with_decorations(false)` in
+            // `src/bin/gui.rs` — required for real per-pixel transparency on
+            // Windows), so the toolbar doubles as the title bar: an invisible
+            // drag strip registered *before* the buttons (later widgets win
+            // egui's hit-test, so the buttons stay clickable on top of it),
+            // plus manual minimize/close controls and double-click-to-maximize.
+            let bar_rect = egui::Rect::from_min_size(
+                ui.max_rect().min,
+                egui::vec2(ui.available_width(), 36.0),
+            );
+            let bar_resp = ui.interact(
+                bar_rect,
+                egui::Id::new("toolbar-drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if bar_resp.drag_started_by(egui::PointerButton::Primary) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if bar_resp.double_clicked() {
+                let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.label(
@@ -271,6 +294,15 @@ impl eframe::App for RenpyExApp {
                 if busy {
                     ui.spinner();
                 }
+                // Window controls pinned to the right edge of the "title bar".
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::steel_button(ui, "❌").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if theme::steel_button(ui, "🗕").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                });
             });
             ui.add_space(3.0);
         });
@@ -401,8 +433,10 @@ fn section_heading(ui: &mut egui::Ui, title: &str) {
 
 impl RenpyExApp {
     /// Draw the portrait at the top of the left panel: the embedded character
-    /// art fit (letterboxed, aspect-preserved) inside the classic RPG
-    /// double-bordered frame. Falls back to a faint hint if decoding failed.
+    /// art scaled to fill the classic RPG double-bordered frame edge-to-edge
+    /// (cover crop — no side gaps; overflow is cropped via UV, anchored to the
+    /// top so the face stays in view). Falls back to a faint hint if decoding
+    /// failed.
     fn portrait_slot(&mut self, ui: &mut egui::Ui) {
         // Upload the embedded PNG as a texture once, on first paint.
         if self.portrait.is_none() {
@@ -414,22 +448,20 @@ impl RenpyExApp {
         let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
         let painter = ui.painter();
         let outer_r = egui::Rounding::same(6.0);
-        painter.rect_filled(rect, outer_r, theme::PANEL_HI);
 
         if let Some(tex) = &self.portrait {
-            // Contain: scale to fit inside the frame without cropping, centered.
+            // Cover: scale so the art fills the whole frame, then crop the
+            // overflow by narrowing the UV window instead of drawing outside
+            // `rect` — centered horizontally, anchored to the top vertically.
             let img = tex.size_vec2();
-            let inner = rect.shrink(5.0);
-            let scale = (inner.width() / img.x).min(inner.height() / img.y);
-            let draw = egui::vec2(img.x * scale, img.y * scale);
-            let img_rect = egui::Rect::from_center_size(rect.center(), draw);
-            painter.image(
-                tex.id(),
-                img_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            let scale = (rect.width() / img.x).max(rect.height() / img.y);
+            let uv_w = rect.width() / (img.x * scale);
+            let uv_h = rect.height() / (img.y * scale);
+            let u0 = (1.0 - uv_w) * 0.5;
+            let uv = egui::Rect::from_min_max(egui::pos2(u0, 0.0), egui::pos2(u0 + uv_w, uv_h));
+            painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
         } else {
+            painter.rect_filled(rect, outer_r, theme::PANEL_HI);
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,

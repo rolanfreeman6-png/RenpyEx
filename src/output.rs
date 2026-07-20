@@ -48,10 +48,11 @@ pub fn wipe(_path: &Path) -> Result<()> {
 
 /// Ensure that `dest` has its parent directory created.
 pub fn ensure_parent(dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent).map_err(|e| RenpyExError::io(parent, e))?;
-        }
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| RenpyExError::io(parent, e))?;
     }
     Ok(())
 }

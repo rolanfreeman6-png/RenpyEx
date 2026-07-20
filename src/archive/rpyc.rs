@@ -13,7 +13,7 @@ use crate::error::RenpyExError;
 use crate::Result;
 
 /// Options for `.rpyc` decompilation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RpycDecompileOptions {
     /// Python interpreter to use (`python` on Windows, `python3` elsewhere).
     pub python: Option<String>,
@@ -21,16 +21,6 @@ pub struct RpycDecompileOptions {
     pub unrpyc: Option<String>,
     /// Decompile to `.rpy` next to the `.rpyc` file when `true`.
     pub overwrite_rpyc: bool,
-}
-
-impl Default for RpycDecompileOptions {
-    fn default() -> Self {
-        Self {
-            python: None,
-            unrpyc: None,
-            overwrite_rpyc: false,
-        }
-    }
 }
 
 /// Locate an `unrpyc` invocation we can use. Returns the python executable

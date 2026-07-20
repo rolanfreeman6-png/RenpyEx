@@ -351,7 +351,7 @@ fn cmd_convert(
             continue;
         }
         converted += 1;
-        if converted % 50 == 0 {
+        if converted.is_multiple_of(50) {
             eprintln!("  [{converted}] converted {}", file.rel.display());
         }
     }

@@ -1,9 +1,48 @@
-# RenpyEx
+<div align="center">
 
-Pure-Rust CLI for **byte-perfect** Ren'Py `.rpa` archive extraction and
-integrity verification.
+# ⚔️ RenpyEx
 
-```
+**Byte-perfect Ren'Py archive extractor & integrity verifier — pure Rust.**
+
+[![Release](https://img.shields.io/github/v/release/rolanfreeman6-png/RenpyEx?style=flat-square&color=ffd166)](https://github.com/rolanfreeman6-png/RenpyEx/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Tests](https://img.shields.io/badge/tests-67_passing-brightgreen?style=flat-square)](#-quality)
+
+*Extract, verify, and convert Ren'Py game assets — with a guarantee that
+every byte out equals every byte in.*
+
+[📥 Download](#-download) • [🚀 Quick start](#-quick-start) • [🖥️ GUI](#%EF%B8%8F-gui) • [🛠️ Build](#%EF%B8%8F-build-from-source) • [🧪 Quality](#-quality)
+
+</div>
+
+---
+
+## ✨ Features
+
+| | Feature | Description |
+|---|---|---|
+| 📦 | **Byte-perfect extraction** | Every emitted byte equals the byte inside the source archive — no silent re-encoding, ever |
+| 🔐 | **SHA-256 integrity** | `verify` re-hashes every file against a `SHA256SUMS.txt` (coreutils-compatible format) to prove nothing was tampered with |
+| 🔍 | **Magic-byte sniffing** | PNG, JPEG, GIF, WebP, BMP, OGG, WAV, MP3, FLAC, Matroska, MP4/M4A recognised by their first bytes; truncated or misnamed files get flagged |
+| 🖼️ | **Image conversion** | Opt-in `convert` re-emits decodable images as PNG or JPEG (quality-adjustable) |
+| 🐍 | **Pickle safety** | Ren'Py archive indexes are pickled Python objects — unpickling is isolated in a separate Python subprocess, JSON-parsed on the Rust side |
+| 🖥️ | **Native GUI** | Optional egui desktop front-end with a retro 16-bit RPG look and a translucent overlay window |
+
+## 📥 Download
+
+Grab the latest Windows binaries from the
+[**Releases page**](https://github.com/rolanfreeman6-png/RenpyEx/releases/latest):
+
+- `renpyex.exe` — command-line tool
+- `renpyex-gui.exe` — desktop GUI
+
+No installer, no runtime dependencies. Python is only needed if you want
+optional `.rpyc` decompilation (via `unrpyc`).
+
+## 🚀 Quick start
+
+```text
 renpyex 0.1.0 — Byte-perfect Ren'Py extraction
 
 USAGE:
@@ -16,104 +55,59 @@ COMMANDS:
     convert   Re-emit decode-able images as PNG or JPEG into --out directory
 ```
 
-## Why
-
-Existing tooling in this niche is fragmented and stale:
-
-| Project | Language | Last activity | Notes |
-|---|---|---|---|
-| `Lattyware/unrpa` | Python | **2022-06 (stale)** | Original `unrpa`. CLI-first, no integrity checks. |
-| `ikremniou/unrparc` | Rust | 2023 | Single-purpose unpacking; no lifecycle checks. |
-| `asakura-minami/RPA-Explorer` | TypeScript (browser) | 2026-04 | Browser-based; no CLI mode. |
-
-RenpyEx is **byte-perfect from disk to disk** with explicit integrity and
-corruption detection.
-
-## What we do
-
-- **Byte-perfect extraction**: every byte emitted equals the byte inside
-  the source archive/file. The `extract` subcommand translates a game's
-  files (or a `.rpa` archive's contents) into a clean output directory and
-  refuses to do anything that would corrupt them (no re-encoding for
-  conversion unless you opt in via `convert`).
-- **SHA-256 integrity**: `verify` reads a `SHA256SUMS.txt` (the standard
-  `coreutils`-compatible format) and re-hashes every referenced file to
-  prove no tampering has occurred.
-- **Magic-byte sniffing**: every read file is classified by its first
-  bytes — truncated or misnamed files are flagged. PNG, JPEG, GIF, WebP,
-  BMP, OGG, WAV, MP3, FLAC, Matroska, MP4/M4A are all recognised;
-  `.rpyc`/`.rpy` are recognised via extension hint.
-- **Python pickle safety**: Ren'Py archive indexes are pickled Python
-  objects; we delegate unpickling to a small Python subprocess and
-  parse JSON on the Rust side. This isolates pickling's well-known
-  security risks in a separate process.
-
-## What we do not (yet) do
-
-- Audio/video conversion (we copy through byte-perfect; convert only
-  applies to images via the `convert` subcommand).
-- Ren'Py `.rpyc → .rpy` decompilation (delegated to Python `unrpyc` if
-  present).
-- Ren'Py file decryption that needs the game-specific in-game key.
-
-## Build
-
 ```bash
-cargo build --release
-# binary at target/release/renpyex(.exe)
+# Inventory a game directory
+renpyex info "C:/Games/MyVN"
+
+# Extract everything byte-perfect (unpack .rpa archives too)
+renpyex extract "C:/Games/MyVN" --out ./extracted --rpa
+
+# Prove the extraction is intact
+renpyex verify ./extracted
+
+# Re-emit images as PNG
+renpyex convert ./extracted --out ./png --to png
 ```
 
-## GUI
+## 🖥️ GUI
 
-A native desktop front-end is available behind the optional `gui` feature. It
-is a thin egui/eframe layer over the same library API the CLI uses — the core
-extraction/verification/conversion code is unchanged and stays the single
-source of truth.
+`renpyex-gui.exe` is a native desktop front-end — a thin egui/eframe layer
+over the same library API the CLI uses, so the core
+extraction/verification/conversion code stays the single source of truth.
+
+- 🎨 **Retro 16-bit console-RPG theme** — deep royal-blue panels, gold
+  headings, light-periwinkle borders, hand-painted steel buttons with a
+  semi-glossy convex bevel
+- 🪟 **Translucent overlay window** — borderless, blended with your desktop
+  at the OS level (`WS_EX_LAYERED`); drag the toolbar to move, double-click
+  it to maximize, 🗕/❌ buttons top-right
+- ⚙️ **Everything the CLI does** — Scan / Extract / Verify / Convert, path
+  pickers, `.rpa` unpacking, optional `.rpyc` decompile, XOR key entry,
+  JPEG quality slider
+- 🧵 **Never freezes** — long operations run on a background thread; the
+  color-coded log streams into the central pane
+- 💾 **Remembers your paths** — persisted to `%APPDATA%\renpyex\config.json`
+  (Windows) or `$XDG_CONFIG_HOME/renpyex/config.json` (Linux/macOS)
+
+## 🛠️ Build from source
 
 ```bash
-# build the GUI binary (pulls the egui/glow stack; off by default)
-cargo build --release --features gui --bin renpyex-gui
-# binary at target/release/renpyex-gui(.exe)
+# CLI (lean — no GUI dependencies)
+cargo build --release
+# → target/release/renpyex(.exe)
 
-# headless runtime smoke (no window; for CI on displayless machines)
+# GUI
+cargo build --release --features gui --bin renpyex-gui
+# → target/release/renpyex-gui(.exe)
+
+# Headless GUI smoke check (no window; for CI on displayless machines)
 renpyex-gui --probe
 ```
 
-- Backend: `eframe` with the `glow` (OpenGL) renderer for portability.
-- Layout: left panel with a framed character portrait on top of the
-  source/output paths and operation settings, central log pane, top toolbar
-  (Scan / Extract / Verify / Convert), bottom status bar reporting state and
-  Python/`unrpyc` availability.
-- Long-running operations run on a background thread (`std::thread` + `mpsc`,
-  no async); the toolbar is disabled while a job is in flight.
-- The last-used source and output paths persist to
-  `%APPDATA%\renpyex\config.json` (Windows) or
-  `$XDG_CONFIG_HOME/renpyex/config.json` (Linux/macOS).
+The default `cargo build` / `cargo test` do **not** compile the GUI stack,
+so the core CLI stays lean.
 
-**Theme:** a retro 16-bit console-RPG palette — deep royal-blue panels, gold
-section headings, light-periwinkle borders — made **fully transparent**: the
-window itself has no opaque backdrop (`ViewportBuilder::with_transparent` +
-a `clear_color` override so the glow-rendered frame buffer clears to zero
-alpha), and every panel fill is a semi-transparent tint of the palette so the
-desktop shows through behind the UI. The palette and frames live in
-`src/gui/theme.rs`. Toolbar and path-picker buttons (`Scan` / `Extract` /
-`Verify` / `Convert` / `Browse…`) use a hand-painted **steel, semi-glossy,
-slightly convex** button style (`theme::steel_button`) — egui's flat
-`Visuals` styling has no gradient/bevel primitive, so the glossy highlight
-band and embossed edge strokes are painted manually, flattening and
-darkening while pressed so the button reads as pushed in. Log lines are
-subtly color-coded on their key markers only: green for success
-(`Extracted` / `Copied` / `Converted` / `Done` / `Verified`), salmon for
-failures (`ERROR` / `MISMATCH` / `MISSING` / `*fail*`), gold for headers, and
-muted for skipped entries. The top-left frame holds a character portrait
-(`src/gui/assets/portrait.png`, downscaled to 384×640 and embedded in the
-binary via `include_bytes!`), aspect-fit inside the double border.
-
-The default `cargo build` / `cargo test` do **not** compile the GUI stack, so
-the core CLI stays lean. GUI logic is covered by `tests/gui_smoke.rs`
-(feature-gated) plus unit tests in `src/gui/`.
-
-## Install (in-tree Python fixture for tests)
+### Test fixtures
 
 ```bash
 python tests/build_fixtures.py
@@ -124,42 +118,40 @@ The fixture in `tests/fixtures/sample.rpa` is built by `build_fixtures.py`
 using the exact format described in Ren'Py's own `loader.py` (RPAv3 → 8-byte
 magic → 16-hex offset → key → zlib-compressed pickled index).
 
-## Quality
+## 🧪 Quality
 
-- 60 unit tests + 1 CLI smoke test + 5 mutation tests, all green on
-  the standard `cargo test`. Total: **66 tests, 0 failures**.
-- Release build under **20s** on a multi-core machine; static release
-  binary, no runtime dependencies except optional Python for `.rpyc`
-  decompile and a real Ren'Py archive `Python` helper for archival
-  unpickling.
-- `cargo build --release` produces zero compiler warnings under the
-  `correctness = deny`, `style = warn`, `suspicious = warn` clippy lint
-  set declared in `Cargo.toml`.
+- ✅ **67 tests, 0 failures** on `cargo test --features gui` — unit tests,
+  CLI smoke test, GUI smoke test, and mutation tests
+- 🧬 **Mutation testing**: `tests/mutations.rs` deliberately corrupts real
+  Ren'Py-formatted bytes (truncation, magic flips, garbage input, `..`
+  traversal payloads) and asserts the parser fails with a structured error —
+  never panics, never emits wrong bytes silently, never writes outside the
+  output directory
+- 🚫 **Zero clippy warnings** under `correctness = deny`, `style`,
+  `complexity`, `suspicious` — across the library, CLI, GUI, and tests
+- 🔒 **`unsafe` locked down**: denied crate-wide; the single exception is
+  the GUI's documented Win32 layered-window setup
+- 🧱 **Illegal states unrepresentable**: `Offset(u64)` / `Length(u64)`
+  newtypes can't be swapped; `Length` is never zero by construction;
+  `RpaVersion` is a closed enum
 
-## Type design (the "illegal states unrepresentable" rule)
+## 🗺️ Comparison
 
-- `Offset(u64)` and `Length(u64)` are newtypes — you cannot pass an
-  `Offset` where a `Length` is wanted.
-- `Length::new(value)` **panics when `value == 0`** because a zero-length
-  archive entry is a corruption signal we always want to surface, never
-  silently round-trip.
-- `RpaEntry::length` is therefore never zero, by type guarantee.
-- `RpaVersion` is a closed enum; downstream `match`es without `_` arms
-  warn about new variants.
+| Project | Language | Notes |
+|---|---|---|
+| **RenpyEx** | 🦀 Rust | Byte-perfect, integrity-checked, CLI + GUI |
+| [`Lattyware/unrpa`](https://github.com/Lattyware/unrpa) | 🐍 Python | Original `unrpa`; CLI-only, no integrity checks, stale since 2022 |
+| [`ikremniou/unrparc`](https://github.com/ikremniou/unrparc) | 🦀 Rust | Single-purpose unpacking, no lifecycle checks |
+| [`asakura-minami/RPA-Explorer`](https://github.com/asakura-minami/RPA-Explorer) | 🌐 TypeScript | Browser-based, no CLI mode |
 
-## Mutation tests
+## 🚧 Out of scope (for now)
 
-`tests/mutations.rs` deliberately corrupts real Ren'Py-formatted bytes
-(truncate, flip magic, garbage input, traversal payload) and asserts the
-parser either:
+- Audio/video conversion — everything is copied through byte-perfect;
+  `convert` only re-encodes images, and only when you ask it to
+- `.rpyc → .rpy` decompilation is delegated to Python
+  [`unrpyc`](https://github.com/CensoredUsername/unrpyc) when present
+- Game-specific in-game decryption keys
 
-1. Returns a structured `RenpyExError` describing the failure, OR
-2. Successfully produces entries that are still coherent with the source
-   (e.g. flipping a byte that happens not to break the format).
+## 📄 License
 
-**Never**: panics, returns wrong bytes silently, or accepts a
-`..` traversal payload.
-
-## License
-
-MIT — see `LICENSE`.
+[MIT](LICENSE)

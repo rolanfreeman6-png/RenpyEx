@@ -2186,12 +2186,14 @@ dependencies = [
  "egui",
  "flate2",
  "image",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

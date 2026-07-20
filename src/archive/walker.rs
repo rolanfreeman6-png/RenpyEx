@@ -131,8 +131,7 @@ fn visit(
             let n = {
                 use std::io::Read;
                 let mut f = fs::File::open(&path).map_err(|e| RenpyExError::io(&path, e))?;
-                let n = f.read(&mut buf).map_err(|e| RenpyExError::io(&path, e))?;
-                n
+                f.read(&mut buf).map_err(|e| RenpyExError::io(&path, e))?
             };
             let magic = detect_with_ext(&buf[..n], ext);
             files.push(FileEntry {
@@ -177,7 +176,7 @@ mod tests {
         let td = tempdir().unwrap();
         let root = td.path();
         sfs::write(root.join("a.rpy"), b"label a: pass\n").unwrap();
-        sfs::write(root.join("b.png"), &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        sfs::write(root.join("b.png"), [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
         sfs::create_dir(root.join("sub")).unwrap();
         sfs::write(root.join("sub").join("c.txt"), b"hello").unwrap();
 

@@ -89,7 +89,7 @@ pub fn detect(data: &[u8]) -> Magic {
     }
 
     // PNG: 89 50 4E 47 0D 0A 1A 0A
-    if data.len() >= 8 && &data[..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+    if data.len() >= 8 && data[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
         return Magic::Png;
     }
 
@@ -186,7 +186,7 @@ pub fn detect_with_ext(data: &[u8], ext_hint: Option<&str>) -> Magic {
         Some("rpy") => Magic::Text,
         Some("py") => Magic::Text,
         Some("txt") => Magic::Text,
-        Some("json") => return detect(data), // small JSON may still be classified as text
+        Some("json") => detect(data), // small JSON may still be classified as text
         _ => Magic::Unknown,
     }
 }

@@ -115,7 +115,7 @@ fn quoted_string(s: &str) -> Option<&str> {
 fn looks_like_hex(s: &str) -> bool {
     // Ren'Py key may be 8 or 16 (or 32 byte) hex chars. Accept any length
     // even number of hex digits, no NUL, bounded to a sane upper limit.
-    if s.is_empty() || s.len() > 64 || s.len() % 2 != 0 {
+    if s.is_empty() || s.len() > 64 || !s.len().is_multiple_of(2) {
         return false;
     }
     s.bytes().all(|b| b.is_ascii_hexdigit())
