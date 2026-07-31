@@ -2,15 +2,15 @@
 
 # ⚔️ RenpyEx
 
-**Byte-perfect Ren'Py archive extractor & integrity verifier — pure Rust.**
+**Ren'Py project doctor, byte-perfect extractor, verifier, and converter — pure Rust.**
 
 [![Release](https://img.shields.io/github/v/release/rolanfreeman6-png/RenpyEx?style=flat-square&color=ffd166)](https://github.com/rolanfreeman6-png/RenpyEx/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-77_passing-brightgreen?style=flat-square)](#-quality)
+[![Tests](https://img.shields.io/badge/tests-90_passing-brightgreen?style=flat-square)](#-quality)
 
-*Extract, verify, and convert Ren'Py game assets — with a guarantee that
-every byte out equals every byte in.*
+*Inspect, extract, verify, and convert Ren'Py game assets — with byte-perfect
+copy paths and explicit read-only health checks.*
 
 [📥 Download](#-download) • [🚀 Quick start](#-quick-start) • [🖥️ GUI](#%EF%B8%8F-gui) • [🛠️ Build](#%EF%B8%8F-build-from-source) • [🧪 Quality](#-quality)
 
@@ -26,6 +26,9 @@ every byte out equals every byte in.*
 | 🔐 | **SHA-256 integrity** | `verify` re-hashes every file against a `SHA256SUMS.txt` (coreutils-compatible format) to prove nothing was tampered with |
 | 🔍 | **Magic-byte sniffing** | PNG, JPEG, GIF, WebP, BMP, OGG, WAV, MP3, FLAC, Matroska, MP4/M4A recognised by their first bytes; truncated or misnamed files get flagged |
 | 🖼️ | **Image conversion** | Opt-in `convert` re-emits decodable images as PNG or JPEG (quality-adjustable) |
+| 🧠 | **Streaming SHA-256** | Verification, manifests, and duplicate checks process large files in fixed-size chunks |
+| 🩺 | **Project Doctor** | Read-only JSON/text audit for media signatures, static asset paths, translation structure, duplicate media, and orphan candidates |
+| 🧰 | **SDK adapter** | Shell-free adapter for the official Ren'Py `lint`, `compile`, `test`, `translate`, `dialogue`, and `distribute` commands |
 | 🐍 | **Pickle safety** | Ren'Py archive indexes are pickled Python objects — unpickling is isolated in a separate Python subprocess, JSON-parsed on the Rust side |
 | 🖥️ | **Native GUI** | Optional egui desktop front-end with a retro 16-bit RPG look and a translucent overlay window |
 
@@ -43,16 +46,18 @@ optional `.rpyc` decompilation (via `unrpyc`).
 ## 🚀 Quick start
 
 ```text
-renpyex 0.1.2 — Byte-perfect Ren'Py extraction
+renpyex 0.2.0 — Ren'Py project health and extraction
 
 USAGE:
-    renpyex <info|extract|verify|convert> [OPTIONS]
+    renpyex <info|extract|verify|convert|doctor|sdk> [OPTIONS]
 
 COMMANDS:
     info      Enumerate files in a game directory and classify by magic bytes
     extract   Walk a game directory and copy files byte-perfect to --out
     verify    Re-hash every file in SHA256SUMS.txt against the actual contents
     convert   Re-emit decode-able images as PNG or JPEG into --out directory
+    doctor    Read-only health report for assets, media, translations, and duplicates
+    sdk       Run an official SDK action with an explicit SDK directory
 ```
 
 ```bash
@@ -67,6 +72,15 @@ renpyex extract "C:/Games/MyVN" --out ./extracted --rpa --overwrite
 
 # Prove the extraction is intact
 renpyex verify ./extracted
+
+# Read-only health report (JSON is suitable for CI)
+renpyex doctor "C:/Games/MyVN" --json > doctor.json
+
+# Optional decompile into the output tree, never next to the source game
+renpyex extract "C:/Games/MyVN" --out ./extracted --rpyc --python python --unrpyc unrpyc.py
+
+# Run official Ren'Py lint without shell interpolation
+renpyex sdk "C:/Games/MyVN" --sdk "C:/renpy-sdk" lint --all-problems
 
 # Re-emit images as PNG
 renpyex convert ./extracted --out ./png --to png
@@ -84,7 +98,7 @@ extraction/verification/conversion code stays the single source of truth.
 - 🪟 **Translucent overlay window** — borderless, blended with your desktop
   at the OS level (`WS_EX_LAYERED`); drag the toolbar to move, double-click
   it to maximize, 🗕/❌ buttons top-right
-- ⚙️ **Everything the CLI does** — Scan / Extract / Verify / Convert, path
+- ⚙️ **Everything the CLI does** — Scan / Extract / Verify / Convert / Doctor, path
   pickers, `.rpa` unpacking, optional `.rpyc` decompile, XOR key entry,
   JPEG quality slider
 - 🧵 **Never freezes** — long operations run on a background thread; the
@@ -123,7 +137,7 @@ magic → 16-hex offset → key → zlib-compressed pickled index).
 
 ## 🧪 Quality
 
-- ✅ **77 tests, 0 failures** on `cargo test --all-targets --features gui` — unit tests,
+- ✅ **90 tests, 0 failures** on `cargo test --all-targets --features gui` — unit tests,
   CLI smoke test, GUI smoke test, and mutation tests
 - ✅ **MIHell-0.1-pc black-box test** — release CLI extracted all 3 RPA archives
   (`1,158/1,158` entries byte-for-byte), verified `1,182/1,182` output files,
@@ -138,8 +152,8 @@ magic → 16-hex offset → key → zlib-compressed pickled index).
   `complexity`, `suspicious` — across the library, CLI, GUI, and tests
 - 🔒 **`unsafe` locked down**: denied crate-wide; the single exception is
   the GUI's documented Win32 layered-window setup
-- 🧱 **Illegal states unrepresentable**: `Offset(u64)` / `Length(u64)`
-  newtypes can't be swapped; `Length` is never zero by construction;
+- 🧱 **Explicit archive invariants**: `Offset(u64)` / `Length(u64)` newtypes
+  cannot be swapped; parser bounds checks reject unsupported offsets/lengths;
   `RpaVersion` is a closed enum
 
 ## 🗺️ Comparison

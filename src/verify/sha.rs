@@ -1,5 +1,9 @@
 //! SHA-256 digest helpers for byte-perfect integrity verification.
 
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
+
 use sha2::{Digest, Sha256};
 
 /// Compute SHA-256 of `data`.
@@ -11,6 +15,29 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&out);
     arr
+}
+
+/// Compute SHA-256 from a reader using a fixed 64KiB buffer.
+pub fn sha256_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+/// Compute SHA-256 of a filesystem file without loading its complete contents.
+pub fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    sha256_reader(&mut file)
 }
 
 /// Format `[u8; 32]` as lowercase hex.
@@ -84,5 +111,11 @@ mod tests {
     fn from_hex_rejects_garbage() {
         assert!(from_hex("00").is_none()); // too short
         assert!(from_hex(&"z".repeat(64)).is_none()); // non-hex
+    }
+
+    #[test]
+    fn reader_hash_matches_in_memory_hash() {
+        let mut data = std::io::Cursor::new(vec![0x5a; 100_000]);
+        assert_eq!(sha256_reader(&mut data).unwrap(), sha256(&vec![0x5a; 100_000]));
     }
 }

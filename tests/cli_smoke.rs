@@ -7,16 +7,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use renpyex::archive::{list_rpa, read_entry};
+use renpyex::archive::{extract_rpa, list_rpa};
 
 fn binary_path() -> PathBuf {
-    let exe = if cfg!(windows) {
-        "renpyex.exe"
-    } else {
-        "renpyex"
-    };
-    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    here.join("target").join("release").join(exe)
+    PathBuf::from(env!("CARGO_BIN_EXE_renpyex"))
 }
 
 fn fixture_path() -> PathBuf {
@@ -26,7 +20,7 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn cli_extract_byte_matches_in_process_extraction() {
     let bin = binary_path();
-    if !bin.exists() || !fixture_path().exists() {
+    if !fixture_path().exists() {
         return;
     }
 
@@ -57,8 +51,10 @@ fn cli_extract_byte_matches_in_process_extraction() {
 
     // Compare in-process extraction with the files that the binary produced.
     let listed = list_rpa(&fixture, None).expect("list in-proc");
+    let expected = tmp.path().join("expected");
+    extract_rpa(&fixture, &expected, None).expect("in-process extract");
     for entry in &listed.entries {
-        let in_proc_bytes = read_entry(&fixture, entry).expect("in-proc read");
+        let in_proc_bytes = std::fs::read(expected.join(&entry.path)).expect("in-proc read");
         let bin_path = out.join("rpa").join("archive.rpa").join(&entry.path);
         let bin_bytes = std::fs::read(&bin_path).expect("bin read");
         assert_eq!(in_proc_bytes, bin_bytes, "byte mismatch for {}", entry.path);
@@ -68,7 +64,7 @@ fn cli_extract_byte_matches_in_process_extraction() {
 #[test]
 fn cli_extract_from_project_root_unpacks_archive() {
     let bin = binary_path();
-    if !bin.exists() || !fixture_path().exists() {
+    if !fixture_path().exists() {
         return;
     }
 
@@ -98,7 +94,7 @@ fn cli_extract_from_project_root_unpacks_archive() {
 #[test]
 fn cli_overwrite_removes_previous_output() {
     let bin = binary_path();
-    if !bin.exists() || !fixture_path().exists() {
+    if !fixture_path().exists() {
         return;
     }
 

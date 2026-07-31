@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use crate::archive::{
-    self, GameWalker, RpycDecompileOptions, decompile_rpyc, extract_rpa, list_rpa,
+    self, GameWalker, RpycDecompileOptions, decompile_rpyc_to, extract_rpa, list_rpa,
 };
 use crate::convert::{ConvertTarget, FormatQuality, convert_to_jpeg, convert_to_png};
 use crate::output;
 use crate::verify::{self, magic::Magic};
+use crate::{doctor, sdk};
 
 /// Top-level CLI argument parser.
 #[derive(Debug, Parser)]
@@ -59,6 +60,12 @@ pub enum Command {
         /// Optional XOR key (8-char hex) for `.rpa` archives.
         #[arg(long = "key")]
         key: Option<String>,
+        /// Python interpreter for optional `.rpyc` decompilation.
+        #[arg(long)]
+        python: Option<String>,
+        /// `unrpyc` script or executable for optional decompilation.
+        #[arg(long)]
+        unrpyc: Option<String>,
     },
     /// Re-hash every file in `--sums` against the actual contents.
     Verify {
@@ -87,6 +94,89 @@ pub enum Command {
         #[arg(long = "overwrite")]
         overwrite: bool,
     },
+    /// Inspect a project without modifying it.
+    Doctor {
+        /// Project root, game directory, or flat directory.
+        dir: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute an official Ren'Py SDK command.
+    Sdk {
+        /// Project root.
+        project: PathBuf,
+        /// SDK directory containing `renpy.py`.
+        #[arg(long)]
+        sdk: PathBuf,
+        /// Maximum duration in seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        /// SDK action.
+        #[command(subcommand)]
+        command: SdkCommand,
+    },
+}
+
+/// Official SDK actions.
+#[derive(Debug, Subcommand)]
+#[allow(missing_docs)]
+pub enum SdkCommand {
+    /// Run lint.
+    Lint {
+        #[arg(long)]
+        all_problems: bool,
+    },
+    /// Compile scripts.
+    Compile {
+        #[arg(long)]
+        keep_orphan_rpyc: bool,
+    },
+    /// Run testcases.
+    Test {
+        suite: Option<String>,
+        #[arg(long)]
+        enable_all: bool,
+        #[arg(long)]
+        report_detailed: bool,
+    },
+    /// Generate translations.
+    Translate {
+        language: String,
+        #[arg(long)]
+        count: bool,
+        #[arg(long)]
+        strings_only: bool,
+    },
+    /// Export dialogue.
+    Dialogue {
+        language: String,
+        #[arg(long)]
+        strings: bool,
+        #[arg(long)]
+        text: bool,
+    },
+    /// Build distribution.
+    Distribute {
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        package: Option<String>,
+        #[arg(long)]
+        no_archive: bool,
+        #[arg(long)]
+        no_update: bool,
+    },
+}
+
+#[derive(Debug)]
+struct ExtractOptions {
+    overwrite: bool,
+    rpa: bool,
+    rpyc: bool,
+    key: Option<String>,
+    python: Option<String>,
+    unrpyc: Option<String>,
 }
 
 impl Command {
@@ -101,7 +191,20 @@ impl Command {
                 rpa,
                 rpyc,
                 key,
-            } => cmd_extract(&dir, &out, overwrite, rpa, rpyc, key.as_deref()),
+                python,
+                unrpyc,
+            } => cmd_extract(
+                &dir,
+                &out,
+                ExtractOptions {
+                    overwrite,
+                    rpa,
+                    rpyc,
+                    key,
+                    python,
+                    unrpyc,
+                },
+            ),
             Command::Verify { dir, sums } => cmd_verify(&dir, sums.as_deref().map(Path::new)),
             Command::Convert {
                 dir,
@@ -110,8 +213,87 @@ impl Command {
                 quality,
                 overwrite,
             } => cmd_convert(&dir, &out, &to, quality, overwrite),
+            Command::Doctor { dir, json } => cmd_doctor(&dir, json),
+            Command::Sdk {
+                project,
+                sdk,
+                timeout,
+                command,
+            } => cmd_sdk(&project, &sdk, timeout, command),
         }
     }
+}
+
+fn cmd_doctor(dir: &Path, as_json: bool) -> crate::Result<()> {
+    let report = doctor::inspect(dir)?;
+    if as_json {
+        println!("{}", doctor::json(&report)?);
+    } else {
+        print!("{}", doctor::text(&report));
+    }
+    if report.has_errors() {
+        Err(crate::RenpyExError::Integrity {
+            message: format!("doctor found {} errors", report.summary.errors),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn cmd_sdk(project: &Path, sdk_dir: &Path, timeout: u64, command: SdkCommand) -> crate::Result<()> {
+    let action = match command {
+        SdkCommand::Lint { all_problems } => sdk::Action::Lint { all_problems },
+        SdkCommand::Compile { keep_orphan_rpyc } => sdk::Action::Compile { keep_orphan_rpyc },
+        SdkCommand::Test {
+            suite,
+            enable_all,
+            report_detailed,
+        } => sdk::Action::Test {
+            suite,
+            enable_all,
+            report_detailed,
+        },
+        SdkCommand::Translate {
+            language,
+            count,
+            strings_only,
+        } => sdk::Action::Translate {
+            language,
+            count,
+            strings_only,
+        },
+        SdkCommand::Dialogue {
+            language,
+            strings,
+            text,
+        } => sdk::Action::Dialogue {
+            language,
+            strings,
+            text,
+        },
+        SdkCommand::Distribute {
+            destination,
+            package,
+            no_archive,
+            no_update,
+        } => sdk::Action::Distribute {
+            destination,
+            package,
+            no_archive,
+            no_update,
+        },
+    };
+    let result = sdk::execute(
+        &sdk::Spec {
+            sdk_dir: sdk_dir.to_path_buf(),
+            timeout: std::time::Duration::from_secs(timeout),
+        },
+        project,
+        &action,
+    )?;
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    Ok(())
 }
 
 fn cmd_info(dir: &Path) -> crate::Result<()> {
@@ -130,15 +312,16 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
     }
     if game_dir.is_dir() {
         let mut rpa_found = 0usize;
-        for entry in
-            std::fs::read_dir(&game_dir).map_err(|e| crate::RenpyExError::io(&game_dir, e))?
-        {
-            let entry = entry.map_err(|e| crate::RenpyExError::io(&game_dir, e))?;
-            let name = entry.file_name().into_string().unwrap_or_default();
-            if name.ends_with(".rpa") {
+        for file in &inv.files {
+            if file
+                .rel
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"))
+            {
                 rpa_found += 1;
-                println!("Archive detected: {name}");
-                if let Ok(listed) = list_rpa(&entry.path(), None) {
+                println!("Archive detected: {}", file.rel.display());
+                if let Ok(listed) = list_rpa(&file.abs, None) {
                     println!(
                         "  {} version, {} entries, {} bytes uncompressed",
                         listed.version,
@@ -155,16 +338,10 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn cmd_extract(
-    dir: &Path,
-    out: &Path,
-    overwrite: bool,
-    rpa: bool,
-    rpyc: bool,
-    key: Option<&str>,
-) -> crate::Result<()> {
-    output::prepare_output(out, overwrite)?;
+fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result<()> {
     let game_dir = archive::walker::resolve_game_dir(dir);
+    output::reject_output_within_source(&game_dir, out)?;
+    output::prepare_output(out, options.overwrite)?;
     let inv = GameWalker::new(game_dir.clone()).walk()?;
     println!(
         "Walking {} ({} files)…",
@@ -175,9 +352,13 @@ fn cmd_extract(
     let mut failures: Vec<String> = Vec::new();
     let total = inv.files.len();
     for (i, file) in inv.files.iter().enumerate() {
-        let is_archive =
-            matches!(file.magic, Magic::Rpa3) || file.rel.to_string_lossy().ends_with(".rpa");
-        if is_archive && !rpa {
+        let is_archive = matches!(file.magic, Magic::Rpa3)
+            || file
+                .rel
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"));
+        if is_archive && !options.rpa {
             continue;
         }
         let dest = match safe_join(out, &file.rel.to_string_lossy()) {
@@ -190,8 +371,8 @@ fn cmd_extract(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|err| crate::RenpyExError::io(parent, err))?;
         }
-        match std::fs::copy(&file.abs, &dest) {
-            Ok(_) => {
+        match output::copy_atomic(&file.abs, &dest) {
+            Ok(()) => {
                 if (i + 1) % 250 == 0 {
                     eprintln!("  [{}/{}] extracted {}", i + 1, total, file.rel.display());
                 }
@@ -200,40 +381,46 @@ fn cmd_extract(
         }
     }
 
-    if rpa {
-        let parsed_key = parse_user_key(key)?;
-        for entry in
-            std::fs::read_dir(&game_dir).map_err(|e| crate::RenpyExError::io(&game_dir, e))?
-        {
-            let entry = entry.map_err(|e| crate::RenpyExError::io(&game_dir, e))?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("rpa") {
-                let dest = out.join("rpa").join(path.file_name().unwrap_or_default());
+    if options.rpa {
+        let parsed_key = parse_user_key(options.key.as_deref())?;
+        for file in &inv.files {
+            if file
+                .rel
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"))
+            {
+                let dest = out.join("rpa").join(&file.rel);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|err| crate::RenpyExError::io(parent, err))?;
                 }
-                match extract_rpa(&path, &dest, parsed_key) {
+                match extract_rpa(&file.abs, &dest, parsed_key) {
                     Ok(listed) => println!(
                         "Extracted {:?} ({} entries, {} bytes uncompressed) → {}",
-                        path.file_name().unwrap_or_default(),
+                        file.rel,
                         listed.entries.len(),
                         listed.total_uncompressed,
                         dest.display()
                     ),
-                    Err(e) => failures.push(format!("rpa {}: {e}", path.display())),
+                    Err(e) => failures.push(format!("rpa {}: {e}", file.rel.display())),
                 }
             }
         }
     }
 
-    if rpyc {
-        let opts = RpycDecompileOptions::default();
+    if options.rpyc {
+        let opts = RpycDecompileOptions {
+            python: options.python,
+            unrpyc: options.unrpyc,
+            overwrite_rpyc: options.overwrite,
+        };
         for file in &inv.files {
             if file.rel.extension().and_then(|s| s.to_str()) != Some("rpyc") {
                 continue;
             }
-            match decompile_rpyc(&file.abs, &opts) {
+            let dest = safe_join(out, &file.rel.to_string_lossy())?;
+            match decompile_rpyc_to(&file.abs, &dest, &opts) {
                 Ok(Some(rpy)) => {
                     println!("Decompiled: {} → {}", file.rel.display(), rpy.display())
                 }
@@ -305,9 +492,11 @@ fn cmd_convert(
             "quality must be in 1..=100, got {quality}"
         )));
     }
+    let game_dir = archive::walker::resolve_game_dir(dir);
+    output::reject_output_within_source(&game_dir, out)?;
     output::prepare_output(out, overwrite)?;
 
-    let inv = GameWalker::new(dir.to_path_buf()).walk()?;
+    let inv = GameWalker::new(game_dir).walk()?;
     let mut converted = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -385,6 +574,12 @@ fn safe_join(out_root: &Path, rel: &str) -> crate::Result<PathBuf> {
 fn safe_join_redir(out_root: &Path, rel: &str) -> crate::Result<PathBuf> {
     let mut joined = out_root.to_path_buf();
     let normalised = rel.replace('\\', "/");
+    if normalised.starts_with('/') || normalised.starts_with("//") {
+        return Err(crate::RenpyExError::PathTraversal {
+            archive: out_root.to_path_buf(),
+            entry: rel.into(),
+        });
+    }
     for piece in normalised.split('/').filter(|s| !s.is_empty()) {
         match piece {
             "." => continue,

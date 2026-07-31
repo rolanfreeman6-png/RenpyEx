@@ -38,6 +38,14 @@ def build_archive(out_path: Path) -> None:
     for path, payload in entries:
         index[path] = [(cursor, len(payload))]
         cursor += len(payload)
+    # One file made of two index chunks validates fragment concatenation.
+    first = b"fragment-one-"
+    second = b"fragment-two"
+    index["fragmented.txt"] = [(cursor, len(first)), (cursor + len(first), len(second))]
+    cursor += len(first) + len(second)
+    prefixed_tail = b"tail"
+    index["prefixed.txt"] = [(cursor, len(prefixed_tail), b"prefix-")]
+    cursor += len(prefixed_tail)
     index_offset = cursor
 
     # Pickle + zlib compress the index (we omit XOR obfuscation with key=0).
@@ -60,6 +68,9 @@ def build_archive(out_path: Path) -> None:
         f.write(pad)
         for _path, payload in entries:
             f.write(payload)
+        f.write(first)
+        f.write(second)
+        f.write(prefixed_tail)
         f.write(compressed)
 
 

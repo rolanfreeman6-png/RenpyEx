@@ -15,11 +15,13 @@
 pub mod archive;
 pub mod cli;
 pub mod convert;
+pub mod doctor;
 pub mod error;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod key;
 pub mod output;
+pub mod sdk;
 pub mod test_fixtures;
 pub mod verify;
 

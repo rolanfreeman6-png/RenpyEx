@@ -11,14 +11,14 @@ pub mod magic;
 pub mod sha;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::error::RenpyExError;
 
-pub use magic::{detect_with_ext, Magic};
-pub use sha::{from_hex, sha256, to_hex};
+pub use magic::{Magic, detect_with_ext};
+pub use sha::{from_hex, sha256, sha256_file, to_hex};
 
 /// Outcome of verifying a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +60,7 @@ pub fn parse_sums(content: &str) -> Result<Vec<(PathBuf, [u8; 32])>> {
             message: format!("line {lineno}: no space separator"),
         })?;
         let path_str = rest.trim_start_matches('*').trim();
+        validate_relative_path(path_str)?;
         let digest = sha::from_hex(hex_part).ok_or_else(|| RenpyExError::Parse {
             path: "<SHA256SUMS>".into(),
             offset: lineno as u64,
@@ -70,6 +71,21 @@ pub fn parse_sums(content: &str) -> Result<Vec<(PathBuf, [u8; 32])>> {
     Ok(out)
 }
 
+fn validate_relative_path(path: &str) -> Result<()> {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("//")
+        || normalized.as_bytes().get(1) == Some(&b':')
+        || normalized.split('/').any(|component| component == "..")
+    {
+        return Err(RenpyExError::Invalid(format!(
+            "SHA256SUMS path must be relative without traversal: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Read a sums file from disk.
 pub fn read_sums(path: &Path) -> Result<Vec<(PathBuf, [u8; 32])>> {
     let content = fs::read_to_string(path).map_err(|e| RenpyExError::io(path, e))?;
@@ -78,17 +94,25 @@ pub fn read_sums(path: &Path) -> Result<Vec<(PathBuf, [u8; 32])>> {
 
 /// Verify a single file against its expected hash and check magic bytes.
 pub fn verify_one(root: &Path, rel: &Path, expected: &[u8; 32]) -> Result<VerifyOutcome> {
+    validate_relative_path(&rel.to_string_lossy())?;
     let full = root.join(rel);
-    let bytes = match fs::read(&full) {
-        Ok(b) => b,
+    let canonical_root = root.canonicalize().map_err(|e| RenpyExError::io(root, e))?;
+    let canonical_full = match full.canonicalize() {
+        Ok(path) => path,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(VerifyOutcome::Missing {
                 path: rel.to_path_buf(),
             });
         }
-        Err(e) => return Err(RenpyExError::io(full, e)),
+        Err(e) => return Err(RenpyExError::io(&full, e)),
     };
-    let actual = sha256(&bytes);
+    if !canonical_full.starts_with(&canonical_root) {
+        return Err(RenpyExError::PathTraversal {
+            archive: root.to_path_buf(),
+            entry: rel.to_string_lossy().into_owned(),
+        });
+    }
+    let actual = sha256_file(&canonical_full).map_err(|e| RenpyExError::io(&canonical_full, e))?;
     if &actual != expected {
         return Ok(VerifyOutcome::HashMismatch {
             path: rel.to_path_buf(),
@@ -97,7 +121,10 @@ pub fn verify_one(root: &Path, rel: &Path, expected: &[u8; 32]) -> Result<Verify
         });
     }
     // Magic-byte sniff for sanity (does not affect outcome).
-    let _ = detect_with_ext(&bytes, rel.extension().and_then(|s| s.to_str()));
+    let mut prefix = [0u8; 64];
+    let mut file = fs::File::open(&canonical_full).map_err(|e| RenpyExError::io(&canonical_full, e))?;
+    let prefix_len = file.read(&mut prefix).map_err(|e| RenpyExError::io(&canonical_full, e))?;
+    let _ = detect_with_ext(&prefix[..prefix_len], rel.extension().and_then(|s| s.to_str()));
     Ok(VerifyOutcome::Ok {
         path: rel.to_path_buf(),
         sha256: to_hex(&actual),
@@ -108,7 +135,7 @@ pub fn verify_one(root: &Path, rel: &Path, expected: &[u8; 32]) -> Result<Verify
 /// the result as a SHA-256SUMS-format file at `out`.
 pub fn emit_sums(root: &Path, out: &Path) -> Result<u64> {
     let mut entries: Vec<(PathBuf, [u8; 32])> = Vec::new();
-    walk(root, root, &mut entries)?;
+    walk(root, root, out, &mut entries)?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let f = fs::File::create(out).map_err(|e| RenpyExError::io(out, e))?;
@@ -125,24 +152,30 @@ pub fn emit_sums(root: &Path, out: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, [u8; 32])>) -> Result<()> {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    sums_path: &Path,
+    out: &mut Vec<(PathBuf, [u8; 32])>,
+) -> Result<()> {
     for entry in fs::read_dir(dir).map_err(|e| RenpyExError::io(dir, e))? {
         let entry = entry.map_err(|e| RenpyExError::io(dir, e))?;
         let path = entry.path();
-        let ft = entry
-            .file_type()
-            .map_err(|e| RenpyExError::io(&path, e))?;
+        let ft = entry.file_type().map_err(|e| RenpyExError::io(&path, e))?;
         if ft.is_dir() {
-            walk(root, &path, out)?;
+            walk(root, &path, sums_path, out)?;
         } else if ft.is_file() {
-            let bytes = fs::read(&path).map_err(|e| RenpyExError::io(&path, e))?;
+            if path == sums_path {
+                continue;
+            }
             let rel = path.strip_prefix(root).map_err(|_| {
                 RenpyExError::invalid(format!(
                     "walk produced path not under root: {}",
                     path.display()
                 ))
             })?;
-            out.push((rel.to_path_buf(), sha256(&bytes)));
+            let digest = sha256_file(&path).map_err(|e| RenpyExError::io(&path, e))?;
+            out.push((rel.to_path_buf(), digest));
         }
     }
     Ok(())
@@ -179,7 +212,8 @@ mod tests {
 
     #[test]
     fn parse_sums_skips_blank_and_comment() {
-        let s = "# comment\n\n0000000000000000000000000000000000000000000000000000000000000000  x\n";
+        let s =
+            "# comment\n\n0000000000000000000000000000000000000000000000000000000000000000  x\n";
         let v = parse_sums(s).unwrap();
         assert_eq!(v.len(), 1);
     }
@@ -235,6 +269,19 @@ mod tests {
     }
 
     #[test]
+    fn emit_sums_excludes_previous_manifest_on_rerun() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        let sums = root.join("SHA256SUMS.txt");
+        emit_sums(root, &sums).unwrap();
+        emit_sums(root, &sums).unwrap();
+        let entries = read_sums(&sums).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, PathBuf::from("a.txt"));
+    }
+
+    #[test]
     fn detect_mutation() {
         let td = tempdir().unwrap();
         let root = td.path();
@@ -262,6 +309,13 @@ mod tests {
         let entries = parse_sums(text).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, PathBuf::from("sample.txt"));
+    }
+
+    #[test]
+    fn parse_sums_rejects_absolute_and_traversal_paths() {
+        let hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(parse_sums(&format!("{hash}  ../outside\n")).is_err());
+        assert!(parse_sums(&format!("{hash}  C:/outside\n")).is_err());
     }
 
     #[test]

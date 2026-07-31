@@ -74,6 +74,9 @@ jobs:
             Write-Host 'No Rust files changed in the release commit.'
           }
 
+      - name: Build deterministic RPA fixtures
+        run: python tests/build_fixtures.py
+
       - name: Run tests with GUI feature
         run: cargo test --all-targets --features gui
 

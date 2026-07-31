@@ -24,12 +24,10 @@
 //! - [`Offset`] and [`Length`] are non-negative `u64` newtypes so it is
 //!   impossible to mix them up in arithmetic or pass one where the other
 //!   is expected.
-//! - [`RpaEntry`] is a sum type with one variant per encoding shape;
-//!   fields are constructed only via dedicated `new_*` constructors that
-//!   reject overflows or empty data.
-//! - All exposed `u64` values come from these constructors, so the
-//!   invalid state `entry.length = 0` cannot be reached when an entry
-//!   exists.
+//! - [`RpaEntry`] preserves each index chunk exactly, including optional
+//!   inline prefix bytes and valid zero-length chunks.
+//! - Parser and extraction boundaries reject offsets or lengths that cannot
+//!   be represented safely by the supported file APIs.
 //!
 //! ## Process-extraction
 //!
@@ -46,7 +44,8 @@ use flate2::read::ZlibDecoder;
 
 use crate::Result;
 use crate::error::RenpyExError;
-use crate::verify::sha::{from_hex, sha256};
+use crate::output;
+use crate::verify::sha::sha256;
 
 /// Magic prefix for RPA-3.0 archives (no leading space): exact 8 bytes
 /// `b"RPA-3.0 "` per Ren'Py `loader.py:RPAv3ArchiveHandler.get_supported_headers`.
@@ -57,24 +56,21 @@ const HEADER_PEEK: usize = 64;
 
 /// Newtype for archive-internal byte offsets.
 ///
-/// Construction enforces `value <= i64::MAX` for compatibility with file
-/// APIs that use `i64`. Mixing this with `Length` produces a compile error
-/// (idiomatic Rust for newtype enforcement of distinct semantics).
+/// The raw value is retained exactly. Parser validation rejects offsets that
+/// cannot be represented by the supported file APIs before extraction.
+/// Mixing this with [`Length`] produces a compile error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Offset(u64);
 
 impl Offset {
-    /// Construct after saturating to `i64::MAX`.
+    /// Construct without silently changing the archived value.
     #[must_use]
     pub fn new(value: u64) -> Self {
-        Self(value.min(i64::MAX as u64))
+        Self(value)
     }
-    /// Construct from a `u64` value, panicking if it exceeds `i64::MAX`.
-    ///
-    /// Prefer [`Offset::new`] in production to avoid panics.
+    /// Construct from a `u64` value.
     #[must_use]
     pub fn new_strict(value: u64) -> Self {
-        assert!(value <= i64::MAX as u64, "offset overflow: {value}");
         Self(value)
     }
     /// Raw value (use only when bridging to external APIs).
@@ -92,24 +88,17 @@ impl fmt::Display for Offset {
 
 /// Newtype for archive-internal byte lengths.
 ///
-/// Unlike [`Offset`] this **must be non-zero** for entries that exist —
-/// an RPA archive never contains a zero-length entry in practice, and a
-/// zero-length claim on extracted output is almost always a sign of
-/// corruption we want to surface, not silently round-trip.
+/// Zero-length entries are valid archive data and are retained exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Length(u64);
 
 impl Length {
-    /// Construct a `Length` after bounding to `i64::MAX`. Panics if zero
-    /// because a zero-length archive entry is an illegal state.
+    /// Construct without silently changing the archived value.
     #[must_use]
     pub fn new(value: u64) -> Self {
-        assert!(value > 0, "Length must be > 0; got {value}");
-        Self(value.min(i64::MAX as u64))
+        Self(value)
     }
-    /// Construct a zero length for special "marker" entries.
-    ///
-    /// Use sparingly and prefer [`Length::new`] elsewhere.
+    /// Construct a zero length.
     #[must_use]
     pub const fn zero() -> Self {
         Self(0)
@@ -156,11 +145,11 @@ pub struct RpaExtracted {
     pub archive_path: PathBuf,
     /// Version.
     pub version: RpaVersion,
-    /// All entries enumerated. Path → entry (later duplicates replace
-    /// earlier ones).
+    /// All index chunks enumerated. Duplicate paths represent fragments that
+    /// [`extract_rpa`] concatenates in archive index order.
     pub entries: Vec<RpaEntry>,
-    /// Total uncompressed payload announced by the archive (sum of all
-    /// entry lengths).
+    /// Total uncompressed payload announced by the archive, including inline
+    /// prefix bytes.
     pub total_uncompressed: u64,
 }
 
@@ -223,7 +212,20 @@ pub fn list_rpa(path: &Path, key: Option<u32>) -> Result<RpaExtracted> {
     };
 
     let entries = read_index(&mut file, offset, archive_key, key, version, path)?;
-    let total = entries.iter().fold(0u64, |acc, e| acc + e.length.get());
+    let total = entries.iter().try_fold(0u64, |acc, e| {
+        let prefix = e.prefix.as_ref().map_or(0, |bytes| bytes.len() as u64);
+        let size = e
+            .length
+            .get()
+            .checked_add(prefix)
+            .ok_or_else(|| RenpyExError::Integrity {
+                message: format!("{}: entry size overflow", path.display()),
+            })?;
+        acc.checked_add(size)
+            .ok_or_else(|| RenpyExError::Integrity {
+                message: format!("{}: uncompressed size overflow", path.display()),
+            })
+    })?;
 
     Ok(RpaExtracted {
         archive_path: path.to_path_buf(),
@@ -240,11 +242,34 @@ pub fn read_entry(archive: &Path, entry: &RpaEntry) -> Result<Vec<u8>> {
     let mut file = fs::File::open(archive).map_err(|e| RenpyExError::io(archive, e))?;
     let off = entry.offset.get();
     let len = entry.length.get();
+    let file_len = fs::metadata(archive)
+        .map_err(|e| RenpyExError::io(archive, e))?
+        .len();
+    if off > file_len || len > file_len - off {
+        return Err(RenpyExError::SizeMismatch {
+            archive: archive.to_path_buf(),
+            entry: entry.path.clone(),
+            claimed: len,
+            available: file_len.saturating_sub(off),
+        });
+    }
+    let len_usize = usize::try_from(len).map_err(|_| RenpyExError::SizeMismatch {
+        archive: archive.to_path_buf(),
+        entry: entry.path.clone(),
+        claimed: len,
+        available: usize::MAX as u64,
+    })?;
+    let prefix_len = entry.prefix.as_ref().map_or(0, Vec::len);
+    let capacity = prefix_len
+        .checked_add(len_usize)
+        .ok_or_else(|| RenpyExError::Integrity {
+            message: format!("{}: entry output size overflow", archive.display()),
+        })?;
 
     file.seek(std::io::SeekFrom::Start(off))
         .map_err(|e| RenpyExError::io(archive, e))?;
 
-    let mut buf = Vec::with_capacity(len as usize);
+    let mut buf = Vec::with_capacity(len_usize);
     file.take(len)
         .read_to_end(&mut buf)
         .map_err(|e| RenpyExError::io(archive, e))?;
@@ -256,7 +281,7 @@ pub fn read_entry(archive: &Path, entry: &RpaEntry) -> Result<Vec<u8>> {
             available: buf.len() as u64,
         });
     }
-    let mut full = Vec::with_capacity(buf.len() + entry.prefix.as_ref().map_or(0, Vec::len));
+    let mut full = Vec::with_capacity(capacity);
     if let Some(prefix) = &entry.prefix {
         full.extend_from_slice(prefix);
     }
@@ -267,9 +292,33 @@ pub fn read_entry(archive: &Path, entry: &RpaEntry) -> Result<Vec<u8>> {
 /// Read and emit byte-perfect contents for every entry in the archive.
 pub fn extract_rpa(archive: &Path, out_root: &Path, key: Option<u32>) -> Result<RpaExtracted> {
     let listed = list_rpa(archive, key)?;
+    let mut grouped: std::collections::BTreeMap<String, Vec<&RpaEntry>> =
+        std::collections::BTreeMap::new();
     for entry in &listed.entries {
-        let bytes = read_entry(archive, entry)?;
-        let dest = safe_join(out_root, &entry.path)?;
+        grouped.entry(entry.path.clone()).or_default().push(entry);
+    }
+    for (path, fragments) in grouped {
+        let total =
+            fragments.iter().try_fold(0usize, |acc, entry| {
+                let prefix = entry.prefix.as_ref().map_or(0, Vec::len);
+                let length =
+                    usize::try_from(entry.length.get()).map_err(|_| RenpyExError::Integrity {
+                        message: format!("{}: entry is too large", archive.display()),
+                    })?;
+                acc.checked_add(prefix.checked_add(length).ok_or_else(|| {
+                    RenpyExError::Integrity {
+                        message: format!("{}: entry size overflow", archive.display()),
+                    }
+                })?)
+                .ok_or_else(|| RenpyExError::Integrity {
+                    message: format!("{}: entry size overflow", archive.display()),
+                })
+            })?;
+        let mut bytes = Vec::with_capacity(total);
+        for entry in fragments {
+            bytes.extend_from_slice(&read_entry(archive, entry)?);
+        }
+        let dest = safe_join(out_root, &path)?;
         write_bytes(&bytes, &dest)?;
     }
     Ok(listed)
@@ -386,10 +435,13 @@ fn parse_pickle_index(
     path: &Path,
 ) -> Result<Vec<RpaEntry>> {
     let script = r#"
-import json, pickle, sys
+import io, json, pickle, sys
 data = sys.stdin.buffer.read()
+class SafeUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError("global objects are not permitted")
 try:
-    obj = pickle.loads(data)
+    obj = SafeUnpickler(io.BytesIO(data)).load()
 except Exception as e:
     print("ERROR:", e, file=sys.stderr)
     sys.exit(1)
@@ -462,10 +514,7 @@ sys.stdout.write('\n'.join(json.dumps(r) for r in out))
         for tup in &parsed.tuples {
             let off_raw = tup.offset.unwrap_or(0);
             let len_raw = tup.length.unwrap_or(0);
-            let prefix_vec: Option<Vec<u8>> = tup
-                .prefix
-                .as_deref()
-                .and_then(|s| from_hex(s).map(Vec::from));
+            let prefix_vec = tup.prefix.as_deref().map(decode_hex_bytes).transpose()?;
 
             let mut off = off_raw;
             let mut len = len_raw;
@@ -478,12 +527,10 @@ sys.stdout.write('\n'.join(json.dumps(r) for r in out))
                 len ^= key as u64;
             }
 
-            // Illegal-state enforcement: an entry cannot claim zero or
-            // negative length after deobfuscation; reject early.
-            if len == 0 {
+            if off > i64::MAX as u64 || len > i64::MAX as u64 {
                 return Err(RenpyExError::Integrity {
                     message: format!(
-                        "{}: entry {:?} has zero length after deobfuscation (corrupt archive)",
+                        "{}: entry {:?} exceeds supported offset/length range",
                         path.display(),
                         parsed.path
                     ),
@@ -505,13 +552,40 @@ fn parse_json_line(s: &str) -> std::result::Result<ParsedIndexLine, String> {
     serde_json::from_str::<ParsedIndexLine>(s).map_err(|e| e.to_string())
 }
 
+fn decode_hex_bytes(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err(RenpyExError::External {
+            tool: "python".into(),
+            message: format!("pickle helper returned odd-length prefix hex: {value:?}"),
+        });
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0]).ok_or_else(|| RenpyExError::External {
+            tool: "python".into(),
+            message: format!("pickle helper returned invalid prefix hex: {value:?}"),
+        })?;
+        let low = hex_nibble(pair[1]).ok_or_else(|| RenpyExError::External {
+            tool: "python".into(),
+            message: format!("pickle helper returned invalid prefix hex: {value:?}"),
+        })?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Write bytes to a path atomically (creates parent dirs as needed).
 fn write_bytes(bytes: &[u8], dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| RenpyExError::io(parent, e))?;
-    }
-    fs::write(dest, bytes).map_err(|e| RenpyExError::io(dest, e))?;
-    Ok(())
+    output::write_atomic(dest, bytes)
 }
 
 /// Join `out_root` and `rel_path`, sanitising to forbid any `..` traversal
@@ -519,6 +593,12 @@ fn write_bytes(bytes: &[u8], dest: &Path) -> Result<()> {
 fn safe_join(out_root: &Path, rel_path: &str) -> Result<PathBuf> {
     let mut joined = out_root.to_path_buf();
     let normalised = rel_path.replace('\\', "/");
+    if normalised.starts_with('/') || normalised.starts_with("//") {
+        return Err(RenpyExError::PathTraversal {
+            archive: out_root.to_path_buf(),
+            entry: rel_path.to_string(),
+        });
+    }
     for piece in normalised.split('/').filter(|s| !s.is_empty()) {
         match piece {
             "." => continue,
@@ -610,19 +690,17 @@ mod tests {
     }
 
     #[test]
-    fn length_rejects_zero_entry() {
-        // Length::new panics if zero — this is a deliberate compile-time
-        // enforced invariant. Use catch_unwind to recover.
-        let result = std::panic::catch_unwind(|| Length::new(0));
-        assert!(result.is_err());
+    fn length_preserves_zero_entry() {
+        let zero = Length::new(0);
+        assert_eq!(zero.get(), 0);
         let ok = Length::new(128);
         assert_eq!(ok.get(), 128);
     }
 
     #[test]
-    fn offset_new_saturates_i64() {
+    fn offset_new_preserves_archived_value() {
         let huge = Offset::new(u64::MAX);
-        assert_eq!(huge.get(), i64::MAX as u64);
+        assert_eq!(huge.get(), u64::MAX);
     }
 
     #[test]
@@ -657,6 +735,17 @@ mod tests {
         let bytes = read_entry(&archive, img).expect("read image_bytes.bin");
         let want: Vec<u8> = (0..=255u8).collect();
         assert_eq!(bytes, want, "image_bytes.bin should be 0..=255");
+
+        let temp = tempfile::tempdir().unwrap();
+        extract_rpa(&archive, temp.path(), None).unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("fragmented.txt")).unwrap(),
+            b"fragment-one-fragment-two"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("prefixed.txt")).unwrap(),
+            b"prefix-tail"
+        );
     }
 
     #[test]

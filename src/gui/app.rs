@@ -30,6 +30,8 @@ pub enum Job {
     Verify,
     /// `convert` — image re-emit.
     Convert,
+    /// `doctor` — read-only project health report.
+    Doctor,
 }
 
 impl Job {
@@ -40,6 +42,7 @@ impl Job {
             Job::Extract => "extracting…",
             Job::Verify => "verifying…",
             Job::Convert => "converting…",
+            Job::Doctor => "checking…",
         }
     }
 }
@@ -225,6 +228,15 @@ fn run_job(
         Job::Extract => ops::extract(source, output, settings),
         Job::Verify => ops::verify(source, None),
         Job::Convert => ops::convert(source, output, settings),
+        Job::Doctor => {
+            let report = crate::doctor::inspect(source)?;
+            let text = crate::doctor::text(&report);
+            if report.has_errors() {
+                Err(crate::RenpyExError::Integrity { message: text })
+            } else {
+                Ok(text)
+            }
+        }
     }
 }
 
@@ -263,7 +275,8 @@ impl eframe::App for RenpyExApp {
             }
             if bar_resp.double_clicked() {
                 let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
 
             ui.add_space(3.0);
@@ -290,6 +303,9 @@ impl eframe::App for RenpyExApp {
                         self.persist();
                         self.start(Job::Convert);
                     }
+                    if theme::steel_button(ui, "Doctor").clicked() {
+                        self.start(Job::Doctor);
+                    }
                 });
                 if busy {
                     ui.spinner();
@@ -300,7 +316,8 @@ impl eframe::App for RenpyExApp {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     if theme::steel_button(ui, "🗕").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
                 });
             });
@@ -393,13 +410,20 @@ impl RenpyExApp {
         section_heading(ui, "Settings");
         ui.checkbox(&mut self.settings.overwrite, "Overwrite non-empty output");
         ui.checkbox(&mut self.settings.include_rpa, "Unpack .rpa archives");
-        ui.checkbox(&mut self.settings.decompile_rpyc, "Decompile .rpyc (needs Python)");
+        ui.checkbox(
+            &mut self.settings.decompile_rpyc,
+            "Decompile .rpyc (needs Python)",
+        );
 
         ui.horizontal(|ui| {
             ui.label("XOR key (hex)");
             let mut key = self.settings.key.clone().unwrap_or_default();
             if ui.text_edit_singleline(&mut key).changed() {
-                self.settings.key = if key.trim().is_empty() { None } else { Some(key) };
+                self.settings.key = if key.trim().is_empty() {
+                    None
+                } else {
+                    Some(key)
+                };
             }
         });
 
@@ -415,7 +439,9 @@ impl RenpyExApp {
                 ui.selectable_value(&mut self.settings.convert_to, ConvertTarget::Jpeg, "JPEG");
             });
         if self.settings.convert_to == ConvertTarget::Jpeg {
-            ui.add(egui::Slider::new(&mut self.settings.jpeg_quality, 1..=100).text("JPEG quality"));
+            ui.add(
+                egui::Slider::new(&mut self.settings.jpeg_quality, 1..=100).text("JPEG quality"),
+            );
         }
     }
 }
@@ -474,7 +500,11 @@ impl RenpyExApp {
         // Double border painted on top so it frames the art crisply.
         painter.rect_stroke(rect, outer_r, egui::Stroke::new(2.0_f32, theme::BORDER));
         let inner = rect.shrink(4.0);
-        painter.rect_stroke(inner, egui::Rounding::same(4.0), egui::Stroke::new(1.0_f32, theme::ACCENT));
+        painter.rect_stroke(
+            inner,
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(1.0_f32, theme::ACCENT),
+        );
     }
 }
 

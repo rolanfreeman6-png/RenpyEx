@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use renpyex::archive::{list_rpa, read_entry, Length, Offset, RpaEntry};
+use renpyex::archive::{Length, Offset, RpaEntry, list_rpa, read_entry};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.rpa")
@@ -78,13 +78,12 @@ fn mutation_flip_header_byte_fails_or_succeeds_noticeably() {
 
 #[test]
 fn mutation_zero_length_entry_rejected() {
-    // Length::new panics on zero — verifies the compile-time invariant.
-    let ok = std::panic::catch_unwind(|| Length::new(0));
-    assert!(ok.is_err(), "Length::new(0) must panic");
+    // Zero-length entries are valid and must not panic.
+    assert_eq!(Length::new(0).get(), 0);
 
-    // Offset saturates to i64::MAX.
+    // Offset construction must not silently alter archived values.
     let big = Offset::new(u64::MAX);
-    assert_eq!(big.get(), i64::MAX as u64);
+    assert_eq!(big.get(), u64::MAX);
 }
 
 #[test]
@@ -117,11 +116,13 @@ fn safe_path_rejects_traversal_payload() {
     let _ = extract_rpa(&path, &outdir, None);
     let _ = fs::write(outdir.join("body"), b"ok");
     let _ = bad; // referenced to silence dead_code
-    let _ = read_entry(&path, &RpaEntry {
-        path: "../escape".into(),
-        offset: Offset::new(0),
-        length: Length::new(1),
-        prefix: None,
-    });
+    let _ = read_entry(
+        &path,
+        &RpaEntry {
+            path: "../escape".into(),
+            offset: Offset::new(0),
+            length: Length::new(1),
+            prefix: None,
+        },
+    );
 }
-

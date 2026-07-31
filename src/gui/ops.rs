@@ -12,14 +12,14 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::archive::{
-    self, decompile_rpyc, extract_rpa, list_rpa, GameWalker, RpycDecompileOptions,
+    self, GameWalker, RpycDecompileOptions, decompile_rpyc_to, extract_rpa, list_rpa,
 };
-use crate::convert::{convert_to_jpeg, convert_to_png, ConvertTarget, FormatQuality};
+use crate::convert::{ConvertTarget, FormatQuality, convert_to_jpeg, convert_to_png};
 use crate::error::RenpyExError;
 use crate::output;
 use crate::verify::{self, magic::Magic};
-use crate::Result;
 
 /// User-editable operation settings mirrored by the left panel controls.
 #[derive(Debug, Clone)]
@@ -69,15 +69,18 @@ pub fn scan(source: &Path) -> Result<String> {
         let _ = writeln!(log, "  {label:<30} {count}");
     }
 
-    if source.is_dir() {
+    if game_dir.is_dir() {
         let mut rpa_found = 0usize;
-        for entry in std::fs::read_dir(source).map_err(|e| RenpyExError::io(source, e))? {
-            let entry = entry.map_err(|e| RenpyExError::io(source, e))?;
-            let name = entry.file_name().into_string().unwrap_or_default();
-            if name.ends_with(".rpa") {
+        for file in &inv.files {
+            if file
+                .rel
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"))
+            {
                 rpa_found += 1;
-                let _ = writeln!(log, "Archive detected: {name}");
-                if let Ok(listed) = list_rpa(&entry.path(), None) {
+                let _ = writeln!(log, "Archive detected: {}", file.rel.display());
+                if let Ok(listed) = list_rpa(&file.abs, None) {
                     let _ = writeln!(
                         log,
                         "  {} version, {} entries, {} bytes uncompressed",
@@ -101,8 +104,9 @@ pub fn scan(source: &Path) -> Result<String> {
 /// Walk `source` and copy files byte-perfect to `output`, honoring `settings`.
 pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<String> {
     let mut log = String::new();
-    output::prepare_output(output, settings.overwrite)?;
     let game_dir = archive::walker::resolve_game_dir(source);
+    output::reject_output_within_source(&game_dir, output)?;
+    output::prepare_output(output, settings.overwrite)?;
     let inv = GameWalker::new(game_dir.clone()).walk()?;
     let _ = writeln!(
         log,
@@ -114,8 +118,12 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
     let mut failures: Vec<String> = Vec::new();
     let total = inv.files.len();
     for file in &inv.files {
-        let is_archive =
-            matches!(file.magic, Magic::Rpa3) || file.rel.to_string_lossy().ends_with(".rpa");
+        let is_archive = matches!(file.magic, Magic::Rpa3)
+            || file
+                .rel
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"));
         if is_archive && !settings.include_rpa {
             continue;
         }
@@ -132,39 +140,40 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
             failures.push(format!("{}: {err}", file.rel.display()));
             continue;
         }
-        if let Err(e) = std::fs::copy(&file.abs, &dest) {
+        if let Err(e) = output::copy_atomic(&file.abs, &dest) {
             failures.push(format!("{}: {e}", file.rel.display()));
         }
     }
     let _ = writeln!(log, "Copied {total} files.");
 
     if settings.include_rpa {
-        for entry in std::fs::read_dir(source).map_err(|e| RenpyExError::io(source, e))? {
-            let entry = entry.map_err(|e| RenpyExError::io(source, e))?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("rpa") {
+        for file in &inv.files {
+            if file
+                .rel
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"))
+            {
                 let parsed_key = parse_user_key(settings.key.as_deref())?;
-                let dest = output
-                    .join("rpa")
-                    .join(path.file_name().unwrap_or_default());
+                let dest = output.join("rpa").join(&file.rel);
                 if let Some(parent) = dest.parent()
                     && let Err(err) = std::fs::create_dir_all(parent)
                 {
-                    failures.push(format!("rpa {}: {err}", path.display()));
+                    failures.push(format!("rpa {}: {err}", file.rel.display()));
                     continue;
                 }
-                match extract_rpa(&path, &dest, parsed_key) {
+                match extract_rpa(&file.abs, &dest, parsed_key) {
                     Ok(listed) => {
                         let _ = writeln!(
                             log,
                             "Extracted {:?} ({} entries, {} bytes uncompressed) \u{2192} {}",
-                            path.file_name().unwrap_or_default(),
+                            file.rel,
                             listed.entries.len(),
                             listed.total_uncompressed,
                             dest.display()
                         );
                     }
-                    Err(e) => failures.push(format!("rpa {}: {e}", path.display())),
+                    Err(e) => failures.push(format!("rpa {}: {e}", file.rel.display())),
                 }
             }
         }
@@ -176,7 +185,8 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
             if file.rel.extension().and_then(|s| s.to_str()) != Some("rpyc") {
                 continue;
             }
-            match decompile_rpyc(&file.abs, &opts) {
+            let dest = safe_join(output, &file.rel.to_string_lossy())?;
+            match decompile_rpyc_to(&file.abs, &dest, &opts) {
                 Ok(Some(rpy)) => {
                     let _ = writeln!(
                         log,
@@ -247,9 +257,11 @@ pub fn verify(source: &Path, sums: Option<&Path>) -> Result<String> {
 /// Re-emit decode-able images from `source` as PNG or JPEG into `output`.
 pub fn convert(source: &Path, output: &Path, settings: &OpSettings) -> Result<String> {
     let mut log = String::new();
+    let game_dir = archive::walker::resolve_game_dir(source);
+    output::reject_output_within_source(&game_dir, output)?;
     output::prepare_output(output, settings.overwrite)?;
 
-    let inv = GameWalker::new(source.to_path_buf()).walk()?;
+    let inv = GameWalker::new(game_dir).walk()?;
     let mut converted = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -327,6 +339,12 @@ fn parse_user_key(s: Option<&str>) -> Result<Option<u32>> {
 fn safe_join(out_root: &Path, rel: &str) -> Result<PathBuf> {
     let mut joined = out_root.to_path_buf();
     let normalised = rel.replace('\\', "/");
+    if normalised.starts_with('/') || normalised.starts_with("//") {
+        return Err(RenpyExError::PathTraversal {
+            archive: out_root.to_path_buf(),
+            entry: rel.to_string(),
+        });
+    }
     for piece in normalised.split('/').filter(|s| !s.is_empty()) {
         match piece {
             "." => continue,
@@ -375,7 +393,10 @@ mod tests {
     fn parse_user_key_accepts_0x_prefix_and_blank() {
         assert_eq!(parse_user_key(None).unwrap(), None);
         assert_eq!(parse_user_key(Some("")).unwrap(), None);
-        assert_eq!(parse_user_key(Some("0xdeadbeef")).unwrap(), Some(0xdead_beef));
+        assert_eq!(
+            parse_user_key(Some("0xdeadbeef")).unwrap(),
+            Some(0xdead_beef)
+        );
         assert_eq!(parse_user_key(Some("deadbeef")).unwrap(), Some(0xdead_beef));
     }
 
