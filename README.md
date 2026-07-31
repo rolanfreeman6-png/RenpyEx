@@ -43,7 +43,7 @@ optional `.rpyc` decompilation (via `unrpyc`).
 ## 🚀 Quick start
 
 ```text
-renpyex 0.1.1 — Byte-perfect Ren'Py extraction
+renpyex 0.1.2 — Byte-perfect Ren'Py extraction
 
 USAGE:
     renpyex <info|extract|verify|convert> [OPTIONS]
