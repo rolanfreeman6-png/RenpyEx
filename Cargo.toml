@@ -1,6 +1,6 @@
 [package]
 name = "renpyex"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Ren'Py archive extractor with byte-perfect extraction and integrity verification"
 license = "MIT"

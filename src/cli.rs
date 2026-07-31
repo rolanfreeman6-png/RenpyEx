@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use crate::archive::{
-    self, decompile_rpyc, extract_rpa, list_rpa, GameWalker, RpycDecompileOptions,
+    self, GameWalker, RpycDecompileOptions, decompile_rpyc, extract_rpa, list_rpa,
 };
-use crate::convert::{convert_to_jpeg, convert_to_png, ConvertTarget, FormatQuality};
+use crate::convert::{ConvertTarget, FormatQuality, convert_to_jpeg, convert_to_png};
 use crate::output;
 use crate::verify::{self, magic::Magic};
 
@@ -102,9 +102,7 @@ impl Command {
                 rpyc,
                 key,
             } => cmd_extract(&dir, &out, overwrite, rpa, rpyc, key.as_deref()),
-            Command::Verify { dir, sums } => {
-                cmd_verify(&dir, sums.as_deref().map(Path::new))
-            }
+            Command::Verify { dir, sums } => cmd_verify(&dir, sums.as_deref().map(Path::new)),
             Command::Convert {
                 dir,
                 out,
@@ -122,8 +120,7 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
     println!("Game directory: {}", game_dir.display());
     println!("Files: {}", inv.files.len());
     println!("Total bytes: {}", inv.total_bytes);
-    let mut by_magic: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
+    let mut by_magic: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for f in &inv.files {
         *by_magic.entry(f.magic.label().to_string()).or_insert(0) += 1;
     }
@@ -131,10 +128,12 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
     for (label, count) in by_magic {
         println!("  {label:<30} {count}");
     }
-    if dir.is_dir() {
+    if game_dir.is_dir() {
         let mut rpa_found = 0usize;
-        for entry in std::fs::read_dir(dir).map_err(|e| crate::RenpyExError::io(dir, e))? {
-            let entry = entry.map_err(|e| crate::RenpyExError::io(dir, e))?;
+        for entry in
+            std::fs::read_dir(&game_dir).map_err(|e| crate::RenpyExError::io(&game_dir, e))?
+        {
+            let entry = entry.map_err(|e| crate::RenpyExError::io(&game_dir, e))?;
             let name = entry.file_name().into_string().unwrap_or_default();
             if name.ends_with(".rpa") {
                 rpa_found += 1;
@@ -167,13 +166,17 @@ fn cmd_extract(
     output::prepare_output(out, overwrite)?;
     let game_dir = archive::walker::resolve_game_dir(dir);
     let inv = GameWalker::new(game_dir.clone()).walk()?;
-    println!("Walking {} ({} files)…", game_dir.display(), inv.files.len());
+    println!(
+        "Walking {} ({} files)…",
+        game_dir.display(),
+        inv.files.len()
+    );
 
     let mut failures: Vec<String> = Vec::new();
     let total = inv.files.len();
     for (i, file) in inv.files.iter().enumerate() {
-        let is_archive = matches!(file.magic, Magic::Rpa3)
-            || file.rel.to_string_lossy().ends_with(".rpa");
+        let is_archive =
+            matches!(file.magic, Magic::Rpa3) || file.rel.to_string_lossy().ends_with(".rpa");
         if is_archive && !rpa {
             continue;
         }
@@ -185,8 +188,7 @@ fn cmd_extract(
             }
         };
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| crate::RenpyExError::io(parent, err))?;
+            std::fs::create_dir_all(parent).map_err(|err| crate::RenpyExError::io(parent, err))?;
         }
         match std::fs::copy(&file.abs, &dest) {
             Ok(_) => {
@@ -199,18 +201,17 @@ fn cmd_extract(
     }
 
     if rpa {
-        for entry in std::fs::read_dir(dir).map_err(|e| crate::RenpyExError::io(dir, e))? {
-            let entry = entry.map_err(|e| crate::RenpyExError::io(dir, e))?;
+        let parsed_key = parse_user_key(key)?;
+        for entry in
+            std::fs::read_dir(&game_dir).map_err(|e| crate::RenpyExError::io(&game_dir, e))?
+        {
+            let entry = entry.map_err(|e| crate::RenpyExError::io(&game_dir, e))?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("rpa") {
-                let parsed_key = parse_user_key(key)?;
-                let dest = out
-                    .join("rpa")
-                    .join(path.file_name().unwrap_or_default());
+                let dest = out.join("rpa").join(path.file_name().unwrap_or_default());
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent).map_err(|err| {
-                        crate::RenpyExError::io(parent, err)
-                    })?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(|err| crate::RenpyExError::io(parent, err))?;
                 }
                 match extract_rpa(&path, &dest, parsed_key) {
                     Ok(listed) => println!(
@@ -314,28 +315,20 @@ fn cmd_convert(
     for file in &inv.files {
         let is_image_payload = matches!(
             file.magic,
-            Magic::Png
-                | Magic::Jpeg
-                | Magic::Gif
-                | Magic::WebP
-                | Magic::Bmp
+            Magic::Png | Magic::Jpeg | Magic::Gif | Magic::WebP | Magic::Bmp
         );
         if !is_image_payload {
             skipped += 1;
             continue;
         }
-        let dest_rel = file
-            .rel
-            .with_extension(match target {
-                ConvertTarget::Png => "png",
-                ConvertTarget::Jpeg => "jpg",
-            });
+        let dest_rel = file.rel.with_extension(match target {
+            ConvertTarget::Png => "png",
+            ConvertTarget::Jpeg => "jpg",
+        });
         let dest = safe_join_redir(out, &dest_rel.to_string_lossy())?;
         let res = match target {
             ConvertTarget::Png => convert_to_png(&file.abs),
-            ConvertTarget::Jpeg => {
-                convert_to_jpeg(&file.abs, FormatQuality(quality))
-            }
+            ConvertTarget::Jpeg => convert_to_jpeg(&file.abs, FormatQuality(quality)),
         };
         let owned = match res {
             Ok(b) => b,
@@ -399,14 +392,11 @@ fn safe_join_redir(out_root: &Path, rel: &str) -> crate::Result<PathBuf> {
                 return Err(crate::RenpyExError::PathTraversal {
                     archive: out_root.to_path_buf(),
                     entry: rel.into(),
-                })
+                });
             }
             _ => {
                 for c in piece.chars() {
-                    if matches!(
-                        c,
-                        '\0' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
-                    ) {
+                    if matches!(c, '\0' | '<' | '>' | ':' | '"' | '|' | '?' | '*') {
                         return Err(crate::RenpyExError::Invalid(format!(
                             "forbidden character {c:?} in {piece:?}"
                         )));

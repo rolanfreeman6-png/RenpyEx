@@ -39,13 +39,13 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::ZlibDecoder;
 
-use crate::error::RenpyExError;
 use crate::Result;
+use crate::error::RenpyExError;
 use crate::verify::sha::{from_hex, sha256};
 
 /// Magic prefix for RPA-3.0 archives (no leading space): exact 8 bytes
@@ -206,20 +206,18 @@ pub fn list_rpa(path: &Path, key: Option<u32>) -> Result<RpaExtracted> {
         .read(&mut header)
         .map_err(|e| RenpyExError::io(path, e))?;
     header.truncate(n);
-    let version =
-        detect_version(&header).ok_or_else(|| RenpyExError::BadMagic {
-            path: path.to_path_buf(),
-            expected: format!("{HEADER_PEEK}-byte RPA header"),
-            actual: ascii_lossy(&header),
-        })?;
+    let version = detect_version(&header).ok_or_else(|| RenpyExError::BadMagic {
+        path: path.to_path_buf(),
+        expected: format!("{HEADER_PEEK}-byte RPA header"),
+        actual: ascii_lossy(&header),
+    })?;
 
     let (offset, archive_key) = match version {
         RpaVersion::V2 => parse_v2_header(&header, path)?,
         RpaVersion::V3 => parse_v3_header(&header, path)?,
         RpaVersion::V1 => {
             return Err(RenpyExError::Invalid(
-                "RPAv1 (.rpi) archives use a different layout; not yet implemented"
-                    .into(),
+                "RPAv1 (.rpi) archives use a different layout; not yet implemented".into(),
             ));
         }
     };
@@ -267,11 +265,7 @@ pub fn read_entry(archive: &Path, entry: &RpaEntry) -> Result<Vec<u8>> {
 }
 
 /// Read and emit byte-perfect contents for every entry in the archive.
-pub fn extract_rpa(
-    archive: &Path,
-    out_root: &Path,
-    key: Option<u32>,
-) -> Result<RpaExtracted> {
+pub fn extract_rpa(archive: &Path, out_root: &Path, key: Option<u32>) -> Result<RpaExtracted> {
     let listed = list_rpa(archive, key)?;
     for entry in &listed.entries {
         let bytes = read_entry(archive, entry)?;
@@ -314,19 +308,15 @@ fn parse_v3_header(header: &[u8], path: &Path) -> Result<(u64, u32)> {
         offset: 25,
         message: "RPAv3 key field not valid UTF-8".into(),
     })?;
-    let offset = u64::from_str_radix(off_str.trim(), 16).map_err(|_| {
-        RenpyExError::Parse {
-            path: path.to_path_buf(),
-            offset: 8,
-            message: format!("RPAv3 offset {off_str:?} is not valid hex"),
-        }
+    let offset = u64::from_str_radix(off_str.trim(), 16).map_err(|_| RenpyExError::Parse {
+        path: path.to_path_buf(),
+        offset: 8,
+        message: format!("RPAv3 offset {off_str:?} is not valid hex"),
     })?;
-    let key = u32::from_str_radix(key_str.trim(), 16).map_err(|_| {
-        RenpyExError::Parse {
-            path: path.to_path_buf(),
-            offset: 25,
-            message: format!("RPAv3 key {key_str:?} is not valid hex"),
-        }
+    let key = u32::from_str_radix(key_str.trim(), 16).map_err(|_| RenpyExError::Parse {
+        path: path.to_path_buf(),
+        offset: 25,
+        message: format!("RPAv3 key {key_str:?} is not valid hex"),
     })?;
     Ok((offset, key))
 }
@@ -395,13 +385,9 @@ fn parse_pickle_index(
     version: RpaVersion,
     path: &Path,
 ) -> Result<Vec<RpaEntry>> {
-    let pickle_hex: String = pickle_bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     let script = r#"
 import json, pickle, sys
-data = bytes.fromhex(sys.argv[1])
+data = sys.stdin.buffer.read()
 try:
     obj = pickle.loads(data)
 except Exception as e:
@@ -425,16 +411,33 @@ for k, v in obj.items():
 sys.stdout.write('\n'.join(json.dumps(r) for r in out))
 "#;
 
-    let mut cmd = std::process::Command::new(if cfg!(windows) {
-        "python"
-    } else {
-        "python3"
-    });
-    cmd.arg("-c").arg(script).arg(&pickle_hex);
-    let output = cmd.output().map_err(|e| RenpyExError::External {
+    let mut cmd = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" });
+    cmd.arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| RenpyExError::External {
         tool: "python".into(),
         message: format!("failed to launch: {e}"),
     })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| RenpyExError::External {
+        tool: "python".into(),
+        message: "failed to open helper stdin".into(),
+    })?;
+    stdin
+        .write_all(pickle_bytes)
+        .map_err(|e| RenpyExError::External {
+            tool: "python".into(),
+            message: format!("failed to send pickle index: {e}"),
+        })?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|e| RenpyExError::External {
+            tool: "python".into(),
+            message: format!("failed to collect helper output: {e}"),
+        })?;
     if !output.status.success() {
         return Err(RenpyExError::External {
             tool: "python".into(),
@@ -451,17 +454,18 @@ sys.stdout.write('\n'.join(json.dumps(r) for r in out))
         if line.is_empty() {
             continue;
         }
-        let parsed: ParsedIndexLine = parse_json_line(line).map_err(|e| {
-            RenpyExError::External {
+        let parsed: ParsedIndexLine =
+            parse_json_line(line).map_err(|e| RenpyExError::External {
                 tool: "python".into(),
                 message: format!("failed to parse helper output: {e}; line={line}"),
-            }
-        })?;
+            })?;
         for tup in &parsed.tuples {
             let off_raw = tup.offset.unwrap_or(0);
             let len_raw = tup.length.unwrap_or(0);
-            let prefix_vec: Option<Vec<u8>> =
-                tup.prefix.as_deref().and_then(|s| from_hex(s).map(Vec::from));
+            let prefix_vec: Option<Vec<u8>> = tup
+                .prefix
+                .as_deref()
+                .and_then(|s| from_hex(s).map(Vec::from));
 
             let mut off = off_raw;
             let mut len = len_raw;
@@ -530,9 +534,9 @@ fn safe_join(out_root: &Path, rel_path: &str) -> Result<PathBuf> {
                         "NUL byte in path component {piece:?}"
                     )));
                 }
-                let mut bad = piece.chars().find(|c| {
-                    matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-                });
+                let mut bad = piece
+                    .chars()
+                    .find(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'));
                 if let Some(c) = bad.take() {
                     return Err(RenpyExError::Invalid(format!(
                         "forbidden character {c:?} in {piece:?}"
@@ -548,7 +552,13 @@ fn safe_join(out_root: &Path, rel_path: &str) -> Result<PathBuf> {
 fn ascii_lossy(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|b| if (0x20..0x7F).contains(b) { *b as char } else { '?' })
+        .map(|b| {
+            if (0x20..0x7F).contains(b) {
+                *b as char
+            } else {
+                '?'
+            }
+        })
         .collect()
 }
 
@@ -626,10 +636,7 @@ mod tests {
         // expected payload committed alongside the fixture.
         let expected: &[(&str, &[u8])] = &[
             ("greeting.txt", b"hello renpyex!\n"),
-            (
-                "readme.md",
-                b"# embedded file\n\nByte-perfect payload.\n",
-            ),
+            ("readme.md", b"# embedded file\n\nByte-perfect payload.\n"),
             ("short.txt", b"ok"),
         ];
         for (path, want) in expected {
@@ -638,13 +645,8 @@ mod tests {
                 .iter()
                 .find(|e| e.path == *path)
                 .unwrap_or_else(|| panic!("{path} missing from archive listing"));
-            let bytes = read_entry(&archive, sample)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
-            assert_eq!(
-                &bytes[..],
-                *want,
-                "byte-perfect mismatch for {path}"
-            );
+            let bytes = read_entry(&archive, sample).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            assert_eq!(&bytes[..], *want, "byte-perfect mismatch for {path}");
         }
         // image_bytes.bin is a deterministic 0..255 sequence; verify it.
         let img = listed

@@ -7,7 +7,7 @@
 [![Release](https://img.shields.io/github/v/release/rolanfreeman6-png/RenpyEx?style=flat-square&color=ffd166)](https://github.com/rolanfreeman6-png/RenpyEx/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-67_passing-brightgreen?style=flat-square)](#-quality)
+[![Tests](https://img.shields.io/badge/tests-77_passing-brightgreen?style=flat-square)](#-quality)
 
 *Extract, verify, and convert Ren'Py game assets — with a guarantee that
 every byte out equals every byte in.*
@@ -43,7 +43,7 @@ optional `.rpyc` decompilation (via `unrpyc`).
 ## 🚀 Quick start
 
 ```text
-renpyex 0.1.0 — Byte-perfect Ren'Py extraction
+renpyex 0.1.1 — Byte-perfect Ren'Py extraction
 
 USAGE:
     renpyex <info|extract|verify|convert> [OPTIONS]
@@ -61,6 +61,9 @@ renpyex info "C:/Games/MyVN"
 
 # Extract everything byte-perfect (unpack .rpa archives too)
 renpyex extract "C:/Games/MyVN" --out ./extracted --rpa
+
+# Replace an existing output directory
+renpyex extract "C:/Games/MyVN" --out ./extracted --rpa --overwrite
 
 # Prove the extraction is intact
 renpyex verify ./extracted
@@ -120,8 +123,12 @@ magic → 16-hex offset → key → zlib-compressed pickled index).
 
 ## 🧪 Quality
 
-- ✅ **67 tests, 0 failures** on `cargo test --features gui` — unit tests,
+- ✅ **77 tests, 0 failures** on `cargo test --all-targets --features gui` — unit tests,
   CLI smoke test, GUI smoke test, and mutation tests
+- ✅ **MIHell-0.1-pc black-box test** — release CLI extracted all 3 RPA archives
+  (`1,158/1,158` entries byte-for-byte), verified `1,182/1,182` output files,
+  converted RGBA PNGs to both PNG and JPEG, and decompiled a real `.rpyc` with
+  external `unrpyc`.
 - 🧬 **Mutation testing**: `tests/mutations.rs` deliberately corrupts real
   Ren'Py-formatted bytes (truncation, magic flips, garbage input, `..`
   traversal payloads) and asserts the parser fails with a structured error —

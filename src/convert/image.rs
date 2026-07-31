@@ -9,8 +9,8 @@ use std::path::Path;
 
 use image::ImageReader;
 
-use crate::error::RenpyExError;
 use crate::Result;
+use crate::error::RenpyExError;
 
 /// Output format for image conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,15 +73,16 @@ pub fn convert_to_png(input: &Path) -> Result<Vec<u8>> {
 /// Re-encode the supplied image bytes to JPEG with the given quality.
 pub fn convert_to_jpeg(input: &Path, quality: FormatQuality) -> Result<Vec<u8>> {
     let img = ensure_decode(input)?;
+    let rgb = img.to_rgb8();
     let mut out = Vec::with_capacity(64 * 1024);
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.0);
     use image::ImageEncoder;
     encoder
         .write_image(
-            img.as_bytes(),
-            img.width(),
-            img.height(),
-            img.color().into(),
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
         )
         .map_err(|e| RenpyExError::Image {
             path: input.to_path_buf(),
@@ -134,13 +135,27 @@ mod tests {
 
     #[test]
     fn jpeg_round_trip() {
-        // Use an RGB8 fixture since JPEG does not support RGBA8.
-        let img = ImageBuffer::<image::Rgb<u8>, _>::from_fn(8, 8, |x, y| {
-            image::Rgb([(x * 16) as u8, (y * 16) as u8, 128])
-        });
-        let mut rgba_buf = Vec::new();
-        let dynimg = image::DynamicImage::ImageRgb8(img);
-        let encoder = image::codecs::png::PngEncoder::new(&mut rgba_buf);
+        let rgba_buf = make_png_bytes();
+        let td = tempdir().unwrap();
+        let src = td.path().join("in.png");
+        std::fs::write(&src, rgba_buf).unwrap();
+        let bufs = convert_to_jpeg(&src, FormatQuality(90)).unwrap();
+        let dec = ImageReader::new(Cursor::new(bufs))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert_eq!(dec.width(), 8);
+        assert_eq!(dec.height(), 8);
+        assert_eq!(dec.color(), image::ColorType::Rgb8);
+    }
+
+    #[test]
+    fn jpeg_drops_alpha_channel() {
+        let img = ImageBuffer::<Rgba<u8>, _>::from_pixel(2, 2, Rgba([12, 34, 56, 0]));
+        let mut input = Vec::new();
+        let dynimg = image::DynamicImage::ImageRgba8(img);
+        let encoder = image::codecs::png::PngEncoder::new(&mut input);
         use image::ImageEncoder;
         encoder
             .write_image(
@@ -153,14 +168,15 @@ mod tests {
 
         let td = tempdir().unwrap();
         let src = td.path().join("in.png");
-        std::fs::write(&src, rgba_buf).unwrap();
+        std::fs::write(&src, input).unwrap();
         let bufs = convert_to_jpeg(&src, FormatQuality(90)).unwrap();
         let dec = ImageReader::new(Cursor::new(bufs))
             .with_guessed_format()
             .unwrap()
             .decode()
             .unwrap();
-        assert_eq!(dec.width(), 8);
-        assert_eq!(dec.height(), 8);
+        assert_eq!(dec.width(), 2);
+        assert_eq!(dec.height(), 2);
+        assert_eq!(dec.color(), image::ColorType::Rgb8);
     }
 }

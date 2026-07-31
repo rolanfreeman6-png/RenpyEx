@@ -5,8 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::error::RenpyExError;
 use crate::Result;
+use crate::error::RenpyExError;
 
 /// Prepare an output directory for use.
 ///
@@ -21,6 +21,7 @@ pub fn prepare_output(path: &Path, overwrite: bool) -> Result<()> {
         Err(e) => Err(RenpyExError::io(path, e)),
         Ok(md) if md.is_dir() => {
             if overwrite {
+                wipe(path)?;
                 Ok(())
             } else {
                 let read = fs::read_dir(path).map_err(|e| RenpyExError::io(path, e))?;
@@ -42,7 +43,20 @@ pub fn prepare_output(path: &Path, overwrite: bool) -> Result<()> {
 }
 
 /// Wipe the contents of an output directory under `--overwrite`.
-pub fn wipe(_path: &Path) -> Result<()> {
+pub fn wipe(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path).map_err(|e| RenpyExError::io(path, e))? {
+        let entry = entry.map_err(|e| RenpyExError::io(path, e))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| RenpyExError::io(&entry_path, e))?;
+        let result = if file_type.is_dir() {
+            fs::remove_dir_all(&entry_path)
+        } else {
+            fs::remove_file(&entry_path)
+        };
+        result.map_err(|e| RenpyExError::io(&entry_path, e))?;
+    }
     Ok(())
 }
 
@@ -62,9 +76,7 @@ pub fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     ensure_parent(dest)?;
     let tmp = dest.with_extension(format!(
         "{}.tmp",
-        dest.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("part")
+        dest.extension().and_then(|s| s.to_str()).unwrap_or("part")
     ));
     fs::write(&tmp, bytes).map_err(|e| RenpyExError::io(&tmp, e))?;
     fs::rename(&tmp, dest).map_err(|e| RenpyExError::io(dest, e))?;
@@ -101,5 +113,6 @@ mod tests {
         fs::write(out.join("x"), b"hi").unwrap();
         assert!(prepare_output(&out, false).is_err());
         prepare_output(&out, true).unwrap();
+        assert!(fs::read_dir(&out).unwrap().next().is_none());
     }
 }
