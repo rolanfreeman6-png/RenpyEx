@@ -136,6 +136,9 @@ path, and 16 MiB per inline prefix. The pickle helper has a 120-second timeout
 256 MiB/1 MiB. Archive payload extraction is streamed; the library's direct
 in-memory single-entry API is capped at 512 MiB.
 
+Optional `unrpyc` decompilation has a 120-second deadline, caps stdout and
+stderr at 16 MiB each, and terminates its process group/tree on timeout.
+
 SDK commands default to `--timeout 1800` seconds and cap stdout and stderr at
 16 MiB each. On timeout RenpyEx terminates the launched process group/tree and
 returns an error.
