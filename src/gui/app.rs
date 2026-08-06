@@ -312,7 +312,7 @@ impl eframe::App for RenpyExApp {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("✦ RENPYEX ✦")
+                    egui::RichText::new("* RENPYEX *")
                         .heading()
                         .strong()
                         .color(theme::ACCENT),
