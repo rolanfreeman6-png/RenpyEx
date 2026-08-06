@@ -575,6 +575,8 @@ struct ParsedIndexTuple {
 #[derive(serde::Deserialize)]
 struct ParsedIndexLine {
     path: String,
+    #[cfg(any(windows, target_os = "macos"))]
+    comparison_path: String,
     #[serde(default)]
     tuples: Vec<ParsedIndexTuple>,
 }
@@ -590,7 +592,7 @@ struct PythonOutput {
 /// start and import the standard-library modules used by the helper.
 pub fn ensure_python_available() -> Result<()> {
     let output = run_python_script(
-        "import io, json, pickle, sys, zlib",
+        "import io, json, pickle, sys, unicodedata, zlib",
         &[],
         &[],
         PYTHON_PREFLIGHT_TIMEOUT,
@@ -602,7 +604,7 @@ pub fn ensure_python_available() -> Result<()> {
         Err(RenpyExError::External {
             tool: "python".into(),
             message: format!(
-                "RPA support requires Python 3 with pickle, json, and zlib; preflight exited with {}: {}",
+                "RPA support requires Python 3 with pickle, json, unicodedata, and zlib; preflight exited with {}: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             ),
@@ -756,7 +758,7 @@ fn parse_pickle_index(
     path: &Path,
 ) -> Result<Vec<RpaEntry>> {
     let script = r#"
-import io, json, pickle, sys
+import io, json, pickle, sys, unicodedata
 
 max_paths = int(sys.argv[1])
 max_tuples = int(sys.argv[2])
@@ -793,6 +795,7 @@ try:
         path_size = len(path.encode("utf-8", "strict"))
         if path_size > max_path_bytes:
             raise pickle.UnpicklingError(f"archive path is {path_size} bytes; limit is {max_path_bytes}")
+        comparison_path = unicodedata.normalize("NFD", path).casefold()
         if not isinstance(raw_tuples, (list, tuple)):
             raise pickle.UnpicklingError(f"entry {path!r} does not contain a tuple list")
 
@@ -825,7 +828,10 @@ try:
         if not first:
             sys.stdout.write("\n")
         first = False
-        sys.stdout.write(json.dumps({"path": path, "tuples": items}, separators=(",", ":")))
+        sys.stdout.write(json.dumps(
+            {"path": path, "comparison_path": comparison_path, "tuples": items},
+            separators=(",", ":")
+        ))
 except Exception as error:
     print("ERROR:", error, file=sys.stderr)
     sys.exit(1)
@@ -890,10 +896,18 @@ except Exception as error:
                 ),
             });
         }
-        if !decoded_paths.insert(parsed.path.clone()) {
+        // Windows paths are case-insensitive, while default macOS filesystems
+        // are also Unicode-normalization-insensitive. NFD + casefold is a
+        // conservative common key computed by Python's versioned Unicode
+        // database; Linux retains byte-distinct UTF-8 path semantics.
+        #[cfg(any(windows, target_os = "macos"))]
+        let comparison_path = &parsed.comparison_path;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let comparison_path = &parsed.path;
+        if !decoded_paths.insert(comparison_path.clone()) {
             return Err(RenpyExError::Integrity {
                 message: format!(
-                    "{}: decoded archive path collision for {:?}",
+                    "{}: filesystem-equivalent decoded archive path collision for {:?}",
                     path.display(),
                     parsed.path
                 ),
@@ -1026,6 +1040,8 @@ elif mode == "single":
     entries = [("keyed.txt", b"official-key")]
 elif mode == "encoding_collision":
     entries = [("café.txt", b"unicode"), (b"caf\xc3\xa9.txt", b"bytes")]
+elif mode == "unicode_normalization_collision":
+    entries = [("café.txt", b"composed"), ("cafe\u0301.txt", b"decomposed")]
 elif mode == "legacy":
     payload = b"legacy"
     pickle_data = b"\x80\x02}q\x00U\x08caf\xe9.txtq\x01]q\x02K\x18K\x06\x86q\x03as."
@@ -1045,7 +1061,7 @@ for name, payload in entries:
     offset += len(payload)
 header = f"RPA-3.0 {offset:016x} {key:08x}\n".encode("ascii")
 assert len(header) == 34
-protocol = 4 if mode == "encoding_collision" else 2
+protocol = 4 if mode in ("encoding_collision", "unicode_normalization_collision") else 2
 open(sys.argv[1], "wb").write(header + body + zlib.compress(pickle.dumps(index, protocol=protocol)))
 "#;
         let status = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
@@ -1118,6 +1134,12 @@ open(sys.argv[1], "wb").write(header + body + zlib.compress(pickle.dumps(index, 
     #[test]
     fn extraction_rejects_paths_that_decode_to_the_same_string() {
         assert_collision_is_rejected_before_writes("encoding_collision");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn extraction_rejects_unicode_normalization_collisions_before_writing() {
+        assert_collision_is_rejected_before_writes("unicode_normalization_collision");
     }
 
     #[test]
@@ -1237,9 +1259,7 @@ open(sys.argv[1], "wb").write(header + body + zlib.compress(pickle.dumps(index, 
     #[test]
     fn rpa3_fixture_byte_perfect_extraction() {
         let archive = test_fixtures::rpa_v3_fixture_path();
-        if !archive.exists() {
-            return; // fixture absent — fixture is generated by tests/build_fixtures.sh
-        }
+        assert!(archive.is_file(), "fixture missing: {}", archive.display());
         let listed = list_rpa(&archive, None).expect("list ok");
         // Every entry must be byte-perfect, byte-for-byte, against the
         // expected payload committed alongside the fixture.
@@ -1286,9 +1306,7 @@ open(sys.argv[1], "wb").write(header + body + zlib.compress(pickle.dumps(index, 
         // [offset, offset+length) of the source archive file directly.
         use std::io::{Read, Seek};
         let archive = test_fixtures::rpa_v3_fixture_path();
-        if !archive.exists() {
-            return;
-        }
+        assert!(archive.is_file(), "fixture missing: {}", archive.display());
         let listed = list_rpa(&archive, None).expect("list ok");
         let mut file = std::fs::File::open(&archive).expect("open");
         for e in listed.entries.iter().take(3) {

@@ -143,11 +143,12 @@ returns an error.
 `SHA256SUMS.txt` uses a deliberately portable UTF-8 subset: normalized relative
 paths with `/` separators and standard 64-hex SHA-256 records. Absolute paths,
 traversal, exact duplicates, file/directory conflicts, case-only aliases on
-Windows/macOS, empty/dot/repeated components, and escaped or non-UTF filenames
-are rejected. It is not a complete implementation of coreutils filename
-escaping. Extraction reserves the output root's `SHA256SUMS.txt` for its
-generated manifest and rejects an input that would map to that path before
-creating or clearing the output directory.
+Windows/macOS, Unicode-normalization aliases in RPA indexes on those targets,
+empty/dot/repeated components, and escaped or non-UTF filenames are rejected.
+It is not a complete implementation of coreutils filename escaping. Extraction
+reserves the output root's `SHA256SUMS.txt` for its generated manifest and
+rejects an input that would map to that path before creating or clearing the
+output directory.
 
 ### Test fixtures
 
