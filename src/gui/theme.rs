@@ -44,7 +44,7 @@ pub fn apply(ctx: &egui::Context) {
     visuals.extreme_bg_color = BG;
     visuals.faint_bg_color = PANEL_HI;
     visuals.override_text_color = Some(FG);
-    visuals.window_rounding = egui::Rounding::same(6.0);
+    visuals.window_corner_radius = egui::CornerRadius::same(6);
     visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
 
     for widgets in [
@@ -54,7 +54,7 @@ pub fn apply(ctx: &egui::Context) {
         &mut visuals.widgets.active,
         &mut visuals.widgets.open,
     ] {
-        widgets.rounding = egui::Rounding::same(4.0);
+        widgets.corner_radius = egui::CornerRadius::same(4);
     }
     visuals.widgets.noninteractive.bg_fill = PANEL;
     visuals.widgets.inactive.bg_fill = PANEL_HI;
@@ -63,22 +63,22 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = PANEL_HI;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
 
-    ctx.set_visuals(visuals);
-
-    let mut style = (*ctx.style()).clone();
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// Frame for the central log pane: navy fill with a crisp
 /// border, matching the retro double-frame look.
 pub fn screen_frame() -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(BG)
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
-        .rounding(egui::Rounding::same(4.0))
-        .inner_margin(egui::Margin::same(6.0))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(6))
 }
 
 /// A steel-gray, semi-glossy button with a slightly convex (embossed) look.
@@ -90,7 +90,9 @@ pub fn screen_frame() -> egui::Frame {
 pub fn steel_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let text_color = egui::Color32::from_rgb(28, 30, 36);
     let font = egui::FontId::proportional(14.0);
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, text_color);
 
     let padding = egui::vec2(14.0, 6.0);
     let size = galley.size() + padding * 2.0;
@@ -102,7 +104,7 @@ pub fn steel_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 
     let pressed = response.is_pointer_button_down_on();
     let hovered = response.hovered();
-    let rounding = egui::Rounding::same(5.0);
+    let rounding = egui::CornerRadius::same(5);
     let painter = ui.painter();
 
     let base = if pressed {
@@ -159,11 +161,38 @@ pub fn steel_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         rect,
         rounding,
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(92, 98, 108)),
+        egui::StrokeKind::Inside,
     );
 
-    let text_offset = if pressed { egui::vec2(0.0, 1.0) } else { egui::Vec2::ZERO };
+    let text_offset = if pressed {
+        egui::vec2(0.0, 1.0)
+    } else {
+        egui::Vec2::ZERO
+    };
     let text_pos = rect.center() - galley.size() / 2.0 + text_offset;
     painter.galley(text_pos, galley, text_color);
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_preserves_theme_when_first_frame_reports_light_system_theme() {
+        let ctx = egui::Context::default();
+
+        apply(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                system_theme: Some(egui::Theme::Light),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+
+        assert_eq!(ctx.global_style().visuals.panel_fill, PANEL);
+    }
 }

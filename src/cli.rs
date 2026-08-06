@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use crate::archive::{
-    self, GameWalker, RpycDecompileOptions, decompile_rpyc_to, extract_rpa, list_rpa,
+    self, GameWalker, RpycDecompileOptions, decompile_rpyc_to, ensure_python_available,
+    extract_rpa, list_rpa,
 };
 use crate::convert::{ConvertTarget, FormatQuality, convert_to_jpeg, convert_to_png};
 use crate::output;
@@ -57,7 +58,7 @@ pub enum Command {
         /// Try to decompile `.rpyc` files via Python `unrpyc`.
         #[arg(long = "rpyc")]
         rpyc: bool,
-        /// Optional XOR key (8-char hex) for `.rpa` archives.
+        /// Override the header XOR key for a nonstandard `.rpa` archive.
         #[arg(long = "key")]
         key: Option<String>,
         /// Python interpreter for optional `.rpyc` decompilation.
@@ -341,8 +342,29 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
 fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result<()> {
     let game_dir = archive::walker::resolve_game_dir(dir);
     output::reject_output_within_source(&game_dir, out)?;
-    output::prepare_output(out, options.overwrite)?;
     let inv = GameWalker::new(game_dir.clone()).walk()?;
+    output::preflight_extraction_destinations(
+        out,
+        inv.files.iter().map(|file| file.rel.as_path()),
+        options.rpa,
+        options.rpyc,
+    )?;
+    let has_rpa = inv.files.iter().any(|file| {
+        file.rel
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rpa"))
+    });
+    let parsed_key = if options.rpa {
+        let key = parse_user_key(options.key.as_deref())?;
+        if has_rpa {
+            ensure_python_available()?;
+        }
+        key
+    } else {
+        None
+    };
+    output::prepare_output(out, options.overwrite)?;
     println!(
         "Walking {} ({} files)…",
         game_dir.display(),
@@ -352,16 +374,7 @@ fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result
     let mut failures: Vec<String> = Vec::new();
     let total = inv.files.len();
     for (i, file) in inv.files.iter().enumerate() {
-        let is_archive = matches!(file.magic, Magic::Rpa3)
-            || file
-                .rel
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"));
-        if is_archive && !options.rpa {
-            continue;
-        }
-        let dest = match safe_join(out, &file.rel.to_string_lossy()) {
+        let dest = match output::safe_join_path(out, &file.rel) {
             Ok(p) => p,
             Err(e) => {
                 failures.push(format!("{}: {e}", file.rel.display()));
@@ -382,7 +395,6 @@ fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result
     }
 
     if options.rpa {
-        let parsed_key = parse_user_key(options.key.as_deref())?;
         for file in &inv.files {
             if file
                 .rel
@@ -419,7 +431,7 @@ fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result
             if file.rel.extension().and_then(|s| s.to_str()) != Some("rpyc") {
                 continue;
             }
-            let dest = safe_join(out, &file.rel.to_string_lossy())?;
+            let dest = output::safe_join_path(out, &file.rel)?;
             match decompile_rpyc_to(&file.abs, &dest, &opts) {
                 Ok(Some(rpy)) => {
                     println!("Decompiled: {} → {}", file.rel.display(), rpy.display())
@@ -431,6 +443,9 @@ fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result
     }
 
     if failures.is_empty() {
+        let manifest = out.join("SHA256SUMS.txt");
+        verify::emit_sums(out, &manifest)?;
+        println!("Manifest: {}", manifest.display());
         println!("Done. Wrote {total} files.");
         Ok(())
     } else {
@@ -464,6 +479,18 @@ fn cmd_verify(dir: &Path, sums: Option<&Path>) -> crate::Result<()> {
                 expected,
                 actual
             ),
+            verify::VerifyOutcome::FormatMismatch {
+                path,
+                expected,
+                detected,
+                message,
+            } => eprintln!(
+                "  INVALID FORMAT {}\n    expected: {}\n    detected: {}\n    detail:   {}",
+                path.display(),
+                expected,
+                detected,
+                message
+            ),
             verify::VerifyOutcome::Missing { path } => {
                 eprintln!("  MISSING {}", path.display())
             }
@@ -487,16 +514,30 @@ fn cmd_convert(
 ) -> crate::Result<()> {
     let target = ConvertTarget::parse(to)
         .ok_or_else(|| crate::RenpyExError::Invalid(format!("invalid --to value: {to}")))?;
-    if !(1..=100).contains(&quality) {
-        return Err(crate::RenpyExError::Invalid(format!(
-            "quality must be in 1..=100, got {quality}"
-        )));
-    }
+    let jpeg_quality = match target {
+        ConvertTarget::Png => FormatQuality::default(),
+        ConvertTarget::Jpeg => FormatQuality::try_from(quality)?,
+    };
     let game_dir = archive::walker::resolve_game_dir(dir);
     output::reject_output_within_source(&game_dir, out)?;
+    let inv = GameWalker::new(game_dir).walk()?;
+    let target_extension = match target {
+        ConvertTarget::Png => "png",
+        ConvertTarget::Jpeg => "jpg",
+    };
+    let mut destinations = output::DestinationRegistry::new(out);
+    for file in &inv.files {
+        if matches!(
+            file.magic,
+            Magic::Png | Magic::Jpeg | Magic::Gif | Magic::WebP | Magic::Bmp
+        ) {
+            let dest_rel = file.rel.with_extension(target_extension);
+            let dest = output::safe_join_path(out, &dest_rel)?;
+            destinations.claim(file.rel.display().to_string(), &dest)?;
+        }
+    }
     output::prepare_output(out, overwrite)?;
 
-    let inv = GameWalker::new(game_dir).walk()?;
     let mut converted = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -510,14 +551,11 @@ fn cmd_convert(
             skipped += 1;
             continue;
         }
-        let dest_rel = file.rel.with_extension(match target {
-            ConvertTarget::Png => "png",
-            ConvertTarget::Jpeg => "jpg",
-        });
-        let dest = safe_join_redir(out, &dest_rel.to_string_lossy())?;
+        let dest_rel = file.rel.with_extension(target_extension);
+        let dest = output::safe_join_path(out, &dest_rel)?;
         let res = match target {
             ConvertTarget::Png => convert_to_png(&file.abs),
-            ConvertTarget::Jpeg => convert_to_jpeg(&file.abs, FormatQuality(quality)),
+            ConvertTarget::Jpeg => convert_to_jpeg(&file.abs, jpeg_quality),
         };
         let owned = match res {
             Ok(b) => b,
@@ -564,42 +602,4 @@ fn parse_user_key(s: Option<&str>) -> crate::Result<Option<u32>> {
     u32::try_from(v)
         .map(Some)
         .map_err(|_| crate::RenpyExError::Invalid("--key must fit in u32".into()))
-}
-
-/// Sanitize and join `out_root` + `rel`, rejecting `..` traversal.
-fn safe_join(out_root: &Path, rel: &str) -> crate::Result<PathBuf> {
-    safe_join_redir(out_root, rel)
-}
-
-fn safe_join_redir(out_root: &Path, rel: &str) -> crate::Result<PathBuf> {
-    let mut joined = out_root.to_path_buf();
-    let normalised = rel.replace('\\', "/");
-    if normalised.starts_with('/') || normalised.starts_with("//") {
-        return Err(crate::RenpyExError::PathTraversal {
-            archive: out_root.to_path_buf(),
-            entry: rel.into(),
-        });
-    }
-    for piece in normalised.split('/').filter(|s| !s.is_empty()) {
-        match piece {
-            "." => continue,
-            ".." => {
-                return Err(crate::RenpyExError::PathTraversal {
-                    archive: out_root.to_path_buf(),
-                    entry: rel.into(),
-                });
-            }
-            _ => {
-                for c in piece.chars() {
-                    if matches!(c, '\0' | '<' | '>' | ':' | '"' | '|' | '?' | '*') {
-                        return Err(crate::RenpyExError::Invalid(format!(
-                            "forbidden character {c:?} in {piece:?}"
-                        )));
-                    }
-                }
-                joined.push(piece);
-            }
-        }
-    }
-    Ok(joined)
 }

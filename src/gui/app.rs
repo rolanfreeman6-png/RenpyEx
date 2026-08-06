@@ -12,7 +12,7 @@
 //! not aesthetics.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 
 use crate::convert::ConvertTarget;
 use crate::gui::config::Config;
@@ -55,6 +55,11 @@ pub struct JobResult {
     pub outcome: Result<String, String>,
 }
 
+enum JobEvent {
+    Progress { job: Job, message: String },
+    Finished(JobResult),
+}
+
 /// The eframe application state.
 pub struct RenpyExApp {
     /// Source (game) directory as typed / picked.
@@ -73,7 +78,7 @@ pub struct RenpyExApp {
     pub python_available: bool,
 
     /// Receiver for background job results (present only while a job runs).
-    rx: Option<Receiver<JobResult>>,
+    rx: Option<Receiver<JobEvent>>,
 
     /// Memoized colorized render of `log`, keyed on its byte length. Rebuilt
     /// only when `log` changes, so the continuous repaints during a job don't
@@ -154,14 +159,22 @@ impl RenpyExApp {
         let output = PathBuf::from(self.output.trim());
         let settings = self.settings.clone();
 
-        let (tx, rx): (Sender<JobResult>, Receiver<JobResult>) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         self.running = Some(job);
         self.status = job.running_label().to_string();
 
         std::thread::spawn(move || {
-            let outcome = run_job(job, &source, &output, &settings).map_err(|e| e.to_string());
-            let _ = tx.send(JobResult { job, outcome });
+            let outcome = {
+                let mut progress = |message: &str| {
+                    let _ = tx.send(JobEvent::Progress {
+                        job,
+                        message: message.to_string(),
+                    });
+                };
+                run_job(job, &source, &output, &settings, &mut progress).map_err(|e| e.to_string())
+            };
+            let _ = tx.send(JobEvent::Finished(JobResult { job, outcome }));
         });
     }
 
@@ -173,30 +186,38 @@ impl RenpyExApp {
     /// otherwise the toolbar stays disabled and the spinner spins forever.
     fn poll(&mut self) {
         use std::sync::mpsc::TryRecvError;
-        let msg = self.rx.as_ref().map(|rx| rx.try_recv());
-        match msg {
-            Some(Ok(result)) => {
-                self.rx = None;
-                self.running = None;
-                match result.outcome {
-                    Ok(log) => {
-                        self.push_log(log.trim_end());
-                        self.status = "done".to_string();
-                    }
-                    Err(e) => {
-                        self.push_log(&format!("ERROR: {e}"));
-                        self.status = format!("error: {e}");
+        while let Some(rx) = self.rx.as_ref() {
+            match rx.try_recv() {
+                Ok(JobEvent::Progress { job, message }) => {
+                    if self.running == Some(job) {
+                        self.status = format!("{} {message}", job.running_label());
                     }
                 }
+                Ok(JobEvent::Finished(result)) => {
+                    self.rx = None;
+                    self.running = None;
+                    match result.outcome {
+                        Ok(log) => {
+                            self.push_log(log.trim_end());
+                            self.status = "done".to_string();
+                        }
+                        Err(error) => {
+                            let status_error = error.lines().next().unwrap_or("operation failed");
+                            self.push_log(&format!("ERROR: {error}"));
+                            self.status = format!("error: {status_error}");
+                        }
+                    }
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.rx = None;
+                    self.running = None;
+                    self.push_log("ERROR: worker terminated unexpectedly (panic)");
+                    self.status = "error: worker terminated".to_string();
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
             }
-            Some(Err(TryRecvError::Disconnected)) => {
-                self.rx = None;
-                self.running = None;
-                self.push_log("ERROR: worker terminated unexpectedly (panic)");
-                self.status = "error: worker terminated".to_string();
-            }
-            // Empty → job still running; None → no job in flight.
-            Some(Err(TryRecvError::Empty)) | None => {}
         }
     }
 
@@ -222,15 +243,18 @@ fn run_job(
     source: &std::path::Path,
     output: &std::path::Path,
     settings: &OpSettings,
+    progress: &mut dyn FnMut(&str),
 ) -> crate::Result<String> {
     match job {
-        Job::Scan => ops::scan(source),
-        Job::Extract => ops::extract(source, output, settings),
-        Job::Verify => ops::verify(source, None),
-        Job::Convert => ops::convert(source, output, settings),
+        Job::Scan => ops::scan_with_progress(source, progress),
+        Job::Extract => ops::extract_with_progress(source, output, settings, progress),
+        Job::Verify => ops::verify_with_progress(source, None, progress),
+        Job::Convert => ops::convert_with_progress(source, output, settings, progress),
         Job::Doctor => {
+            progress("inspecting project");
             let report = crate::doctor::inspect(source)?;
             let text = crate::doctor::text(&report);
+            progress("doctor report ready");
             if report.has_errors() {
                 Err(crate::RenpyExError::Integrity { message: text })
             } else {
@@ -249,12 +273,18 @@ impl eframe::App for RenpyExApp {
         egui::Rgba::from(theme::BG).to_array()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
 
+        if self.running.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let busy = self.running.is_some();
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             // The window is borderless (`with_decorations(false)` in
             // `src/bin/gui.rs` — required for real per-pixel transparency on
             // Windows), so the toolbar doubles as the title bar: an invisible
@@ -324,7 +354,7 @@ impl eframe::App for RenpyExApp {
             ui.add_space(3.0);
         });
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.status).color(theme::FG));
                 ui.separator();
@@ -337,11 +367,11 @@ impl eframe::App for RenpyExApp {
             });
         });
 
-        egui::SidePanel::left("controls")
+        egui::Panel::left("controls")
             .resizable(true)
-            .default_width(340.0)
-            .min_width(300.0)
-            .show(ctx, |ui| {
+            .default_size(340.0)
+            .min_size(300.0)
+            .show(ui, |ui| {
                 // Portrait art. Kept outside the disabled scope so it stays at
                 // full contrast while a job runs.
                 self.portrait_slot(ui);
@@ -353,7 +383,7 @@ impl eframe::App for RenpyExApp {
                     });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             section_heading(ui, "Log");
             theme::screen_frame().show(ui, |ui| {
                 // `both` so long, unwrapped monospace lines (e.g. absolute paths
@@ -375,11 +405,6 @@ impl eframe::App for RenpyExApp {
                     });
             });
         });
-
-        if busy {
-            // Keep repainting so the channel is drained promptly.
-            ctx.request_repaint();
-        }
     }
 }
 
@@ -473,7 +498,7 @@ impl RenpyExApp {
         let h = (w * 1.4).min(360.0);
         let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
         let painter = ui.painter();
-        let outer_r = egui::Rounding::same(6.0);
+        let outer_r = egui::CornerRadius::same(6);
 
         if let Some(tex) = &self.portrait {
             // Cover: scale so the art fills the whole frame, then crop the
@@ -498,12 +523,18 @@ impl RenpyExApp {
         }
 
         // Double border painted on top so it frames the art crisply.
-        painter.rect_stroke(rect, outer_r, egui::Stroke::new(2.0_f32, theme::BORDER));
+        painter.rect_stroke(
+            rect,
+            outer_r,
+            egui::Stroke::new(2.0_f32, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
         let inner = rect.shrink(4.0);
         painter.rect_stroke(
             inner,
-            egui::Rounding::same(4.0),
+            egui::CornerRadius::same(4),
             egui::Stroke::new(1.0_f32, theme::ACCENT),
+            egui::StrokeKind::Inside,
         );
     }
 }
@@ -583,5 +614,75 @@ fn log_line_color(line: &str) -> egui::Color32 {
         theme::LOG_INFO
     } else {
         theme::FG
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn poll_observes_progress_before_terminal_result() {
+        let mut app = RenpyExApp::new();
+        app.log.clear();
+        app.status = Job::Extract.running_label().to_string();
+        app.running = Some(Job::Extract);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.rx = Some(receiver);
+        let interleave = Arc::new(Barrier::new(2));
+        let worker_interleave = Arc::clone(&interleave);
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(JobEvent::Progress {
+                    job: Job::Extract,
+                    message: "copied 1 of 2 files".into(),
+                })
+                .unwrap();
+            worker_interleave.wait();
+            worker_interleave.wait();
+            sender
+                .send(JobEvent::Finished(JobResult {
+                    job: Job::Extract,
+                    outcome: Ok("Done. Wrote 2 files.".into()),
+                }))
+                .unwrap();
+        });
+
+        interleave.wait();
+        app.poll();
+        assert_eq!(app.running, Some(Job::Extract));
+        assert_eq!(app.status, "extracting… copied 1 of 2 files");
+        assert!(app.log.is_empty(), "terminal log arrived before completion");
+
+        interleave.wait();
+        worker.join().unwrap();
+        app.poll();
+        assert_eq!(app.running, None);
+        assert_eq!(app.status, "done");
+        assert_eq!(app.log, "Done. Wrote 2 files.");
+    }
+
+    #[test]
+    fn terminal_error_keeps_full_log_but_uses_one_status_line() {
+        let mut app = RenpyExApp::new();
+        app.log.clear();
+        app.running = Some(Job::Verify);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.rx = Some(receiver);
+        sender
+            .send(JobEvent::Finished(JobResult {
+                job: Job::Verify,
+                outcome: Err("hash verification failed\nMISMATCH file.txt".into()),
+            }))
+            .unwrap();
+
+        app.poll();
+
+        assert_eq!(app.status, "error: hash verification failed");
+        assert_eq!(
+            app.log,
+            "ERROR: hash verification failed\nMISMATCH file.txt"
+        );
     }
 }

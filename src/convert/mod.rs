@@ -15,7 +15,5 @@
 pub mod image;
 pub mod targets;
 
-pub use image::{
-    convert_to_jpeg, convert_to_png, ensure_decode, FormatQuality, ImageFormat,
-};
-pub use targets::{ConvertTarget, ConversionPlan};
+pub use image::{FormatQuality, ImageFormat, convert_to_jpeg, convert_to_png, ensure_decode};
+pub use targets::{ConversionPlan, ConvertTarget};

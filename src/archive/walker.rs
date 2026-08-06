@@ -18,12 +18,17 @@
 //! a `game/` subfolder). We lean on `verify::magic::detect` to classify
 //! each file.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::RenpyExError;
 use crate::Result;
-use crate::verify::magic::{detect_with_ext, Magic};
+use crate::error::RenpyExError;
+use crate::verify::magic::{Magic, detect_with_ext};
+
+// Content classification is a bounded hint. Four KiB catches delayed binary
+// markers without making directory inventory proportional to file size.
+const MAGIC_SAMPLE_BYTES: usize = 4096;
 
 /// A single file entry discovered by the walker.
 #[derive(Debug, Clone)]
@@ -108,11 +113,10 @@ fn visit(
     for entry in fs::read_dir(dir).map_err(|e| RenpyExError::io(dir, e))? {
         let entry = entry.map_err(|e| RenpyExError::io(dir, e))?;
         let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        if name.starts_with('.') || skip.iter().any(|s| s == name) {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.')
+            || skip.iter().any(|skipped| name == OsStr::new(skipped))
+        {
             continue;
         }
         let ft = entry.file_type().map_err(|e| RenpyExError::io(&path, e))?;
@@ -120,14 +124,16 @@ fn visit(
             visit(root, &path, skip, files, total)?;
         } else if ft.is_file() {
             let md = entry.metadata().map_err(|e| RenpyExError::io(&path, e))?;
-            let rel = path.strip_prefix(root).map_err(|_| RenpyExError::Invalid(format!(
-                "walker produced path not under root: {}",
-                path.display()
-            )))?;
+            let rel = path.strip_prefix(root).map_err(|_| {
+                RenpyExError::Invalid(format!(
+                    "walker produced path not under root: {}",
+                    path.display()
+                ))
+            })?;
             let ext = rel.extension().and_then(|s| s.to_str());
-            // Read a small magic-byte snippet (first 16 bytes) without
+            // Read a bounded magic-byte sample without
             // loading the whole file.
-            let mut buf = [0u8; 16];
+            let mut buf = [0u8; MAGIC_SAMPLE_BYTES];
             let n = {
                 use std::io::Read;
                 let mut f = fs::File::open(&path).map_err(|e| RenpyExError::io(&path, e))?;
@@ -140,7 +146,12 @@ fn visit(
                 size: md.len(),
                 magic,
             });
-            *total = total.saturating_add(md.len());
+            *total = total.checked_add(md.len()).ok_or_else(|| {
+                RenpyExError::Invalid(format!(
+                    "total byte count overflow while walking {}",
+                    root.display()
+                ))
+            })?;
         }
     }
     Ok(())
@@ -176,7 +187,11 @@ mod tests {
         let td = tempdir().unwrap();
         let root = td.path();
         sfs::write(root.join("a.rpy"), b"label a: pass\n").unwrap();
-        sfs::write(root.join("b.png"), [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        sfs::write(
+            root.join("b.png"),
+            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        )
+        .unwrap();
         sfs::create_dir(root.join("sub")).unwrap();
         sfs::write(root.join("sub").join("c.txt"), b"hello").unwrap();
 
@@ -187,8 +202,10 @@ mod tests {
             .iter()
             .map(|f| (f.rel.to_string_lossy().to_string(), f))
             .collect();
-        assert!(by_name.get("a.rpy").unwrap().magic == Magic::Text
-            || by_name.get("a.rpy").unwrap().magic == Magic::Unknown);
+        assert!(
+            by_name.get("a.rpy").unwrap().magic == Magic::Text
+                || by_name.get("a.rpy").unwrap().magic == Magic::Unknown
+        );
         assert_eq!(by_name.get("b.png").unwrap().magic, Magic::Png);
     }
 
@@ -249,5 +266,32 @@ mod tests {
         std::fs::write(root.join("c"), vec![0u8; 75]).unwrap();
         let inv = GameWalker::new(root.to_path_buf()).walk().unwrap();
         assert_eq!(inv.total_bytes, 425);
+    }
+
+    #[test]
+    fn walker_sample_detects_binary_byte_after_sixteen_ascii_bytes() {
+        let td = tempdir().unwrap();
+        let mut bytes = b"0123456789abcdef".to_vec();
+        bytes.push(0);
+        std::fs::write(td.path().join("binary.dat"), bytes).unwrap();
+
+        let inv = GameWalker::new(td.path().to_path_buf()).walk().unwrap();
+        assert_eq!(inv.files.len(), 1);
+        assert_eq!(inv.files[0].magic, Magic::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_retains_non_utf8_file_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let td = tempdir().unwrap();
+        let name = OsString::from_vec(vec![b'f', 0x80]);
+        std::fs::write(td.path().join(&name), b"payload").unwrap();
+
+        let inv = GameWalker::new(td.path().to_path_buf()).walk().unwrap();
+        assert_eq!(inv.files.len(), 1);
+        assert_eq!(inv.files[0].rel.as_os_str(), name.as_os_str());
     }
 }

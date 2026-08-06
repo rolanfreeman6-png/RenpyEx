@@ -10,7 +10,8 @@ pub mod rpyc;
 pub mod walker;
 
 pub use rpa::{
-    Length, Offset, RpaEntry, RpaExtracted, RpaVersion, extract_rpa, list_rpa, read_entry,
+    Length, Offset, RpaEntry, RpaExtracted, RpaVersion, ensure_python_available, extract_rpa,
+    list_rpa, read_entry,
 };
 pub use rpyc::{RpycDecompileOptions, decompile_rpyc, decompile_rpyc_to, find_unrpyc};
 pub use walker::{GameInventory, GameWalker};

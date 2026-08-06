@@ -32,9 +32,8 @@ impl Config {
 
     /// Persist this config to disk, creating parent directories as needed.
     pub fn save(&self) -> std::io::Result<()> {
-        let path = config_path().ok_or_else(|| {
-            std::io::Error::other("could not determine config directory")
-        })?;
+        let path = config_path()
+            .ok_or_else(|| std::io::Error::other("could not determine config directory"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

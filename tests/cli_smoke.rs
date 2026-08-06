@@ -121,3 +121,159 @@ fn cli_overwrite_removes_previous_output() {
     );
     assert!(!out.join("old").exists());
 }
+
+#[test]
+fn cli_extract_without_rpa_option_copies_archive_and_reports_exact_count() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("source");
+    let out = tmp.path().join("out");
+    std::fs::create_dir(&source).expect("mkdir source");
+    let archive_bytes = b"RPA-3.0 opaque archive bytes";
+    std::fs::write(source.join("archive.rpa"), archive_bytes).expect("write archive");
+
+    let output = Command::new(binary_path())
+        .arg("extract")
+        .arg(&source)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("spawn renpyex");
+
+    assert!(output.status.success(), "extract failed: {output:?}");
+    assert_eq!(
+        std::fs::read(out.join("archive.rpa")).unwrap(),
+        archive_bytes
+    );
+    let manifest = out.join("SHA256SUMS.txt");
+    let (verified, failures) = renpyex::verify::verify_all(&out, &manifest).unwrap();
+    assert_eq!(verified, 1);
+    assert!(failures.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Done. Wrote 1 files."),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn cli_convert_rejects_destination_collision_before_writing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("source");
+    let out = tmp.path().join("out");
+    std::fs::create_dir(&source).expect("mkdir source");
+    let image = image::RgbImage::from_pixel(1, 1, image::Rgb([12, 34, 56]));
+    image
+        .save_with_format(source.join("same.png"), image::ImageFormat::Png)
+        .expect("write png");
+    image
+        .save_with_format(source.join("same.jpg"), image::ImageFormat::Jpeg)
+        .expect("write jpeg");
+
+    let output = Command::new(binary_path())
+        .arg("convert")
+        .arg(&source)
+        .arg("--out")
+        .arg(&out)
+        .arg("--to")
+        .arg("png")
+        .output()
+        .expect("spawn renpyex");
+
+    assert!(
+        !output.status.success(),
+        "destination collision was accepted"
+    );
+    assert!(
+        !out.exists() || std::fs::read_dir(&out).unwrap().next().is_none(),
+        "collision preflight left converted output"
+    );
+}
+
+#[test]
+fn cli_rpyc_uses_resolved_unrpyc_path_when_cwd_differs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("source");
+    let output_dir = tmp.path().join("output");
+    let tools_dir = tmp.path().join("tools");
+    let unrelated_cwd = tmp.path().join("cwd");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&tools_dir).unwrap();
+    std::fs::create_dir(&unrelated_cwd).unwrap();
+    std::fs::write(source.join("script.rpyc"), b"compiled").unwrap();
+
+    #[cfg(windows)]
+    let tool_path = tools_dir.join("unrpyc.py");
+    #[cfg(not(windows))]
+    let tool_path = tools_dir.join("unrpyc");
+    let script = r#"#!/usr/bin/env python3
+from pathlib import Path
+import sys
+Path(sys.argv[1]).with_suffix(".rpy").write_bytes(b"label fake:\n    pass\n")
+"#;
+    std::fs::write(&tool_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&tool_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool_path, permissions).unwrap();
+    }
+
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut search_paths = vec![tools_dir.clone()];
+    search_paths.extend(std::env::split_paths(&existing_path));
+    let joined_path = std::env::join_paths(search_paths).unwrap();
+    let mut command = Command::new(binary_path());
+    command
+        .current_dir(&unrelated_cwd)
+        .env("PATH", joined_path)
+        .arg("extract")
+        .arg(&source)
+        .arg("--out")
+        .arg(&output_dir)
+        .arg("--rpyc");
+    #[cfg(windows)]
+    command.env("PATHEXT", ".PY;.EXE;.COM;.BAT;.CMD");
+    let output = command.output().expect("spawn renpyex");
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(output_dir.join("script.rpy")).unwrap(),
+        "label fake:\n    pass\n"
+    );
+}
+
+#[test]
+fn cli_extract_rejects_source_manifest_collision_before_writing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source");
+    let output_dir = temp.path().join("output");
+    std::fs::create_dir(&source).expect("mkdir source");
+    std::fs::write(source.join("payload.txt"), b"payload").expect("write payload");
+    std::fs::write(source.join("SHA256SUMS.txt"), b"source manifest")
+        .expect("write source manifest");
+
+    let output = Command::new(binary_path())
+        .arg("extract")
+        .arg(&source)
+        .arg("--out")
+        .arg(&output_dir)
+        .output()
+        .expect("spawn renpyex");
+
+    assert!(!output.status.success(), "manifest collision was accepted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("collision"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output_dir.exists() || std::fs::read_dir(output_dir).unwrap().next().is_none(),
+        "manifest collision preflight left output"
+    );
+}

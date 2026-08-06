@@ -1,9 +1,13 @@
 //! RenpyEx — Ren'Py archive extractor with byte-perfect extraction.
 //!
 //! Core invariants:
-//! - Extracted files are byte-perfect copies of source.
-//! - All cryptographic checks (SHA-256) are computed before and after extraction.
-//! - Magic-byte detection catches truncation and corruption.
+//! - Copy and RPA extraction paths do not transcode logical payload bytes.
+//! - Extraction emits SHA-256 sums for written files, and verification checks
+//!   those sums against a supplied manifest.
+//! - Supported extensions are checked against bounded signatures; recognized
+//!   image headers are also parsed for dimensions.
+//! - Traversal, normalized aliases, file/directory conflicts, and case-only
+//!   aliases on Windows/macOS are rejected before output is written.
 //! - No `unsafe` code is allowed (enforced via lints).
 //!
 //! See README for CLI usage.

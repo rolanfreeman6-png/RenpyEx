@@ -1,9 +1,8 @@
 //! Image conversion: read a decoded image and re-encode into a target
 //! format.
 //!
-//! Both `convert_to_png` and `convert_to_jpeg` are lossless w.r.t. PNG
-//! encoding once the image is in memory; JPEG is intrinsically lossy but
-//! quality parameter is exposed.
+//! PNG output preserves decoded pixel values and dimensions; JPEG is
+//! intrinsically lossy and discards alpha. Source metadata is not preserved.
 
 use std::path::Path;
 
@@ -22,12 +21,37 @@ pub enum ImageFormat {
 }
 
 /// JPEG quality, expressed as a percentage in `1..=100`.
+///
+/// The tuple field remains public for source compatibility; conversion still
+/// validates it at the API boundary. New callers should use [`TryFrom<u8>`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatQuality(pub u8);
 
 impl Default for FormatQuality {
     fn default() -> Self {
         Self(90)
+    }
+}
+
+impl TryFrom<u8> for FormatQuality {
+    type Error = RenpyExError;
+
+    fn try_from(value: u8) -> Result<Self> {
+        if (1..=100).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(RenpyExError::invalid(format!(
+                "JPEG quality must be in 1..=100, got {value}"
+            )))
+        }
+    }
+}
+
+impl FormatQuality {
+    /// Return the raw quality value after construction through [`TryFrom`].
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
     }
 }
 
@@ -47,10 +71,8 @@ pub fn ensure_decode(path: &Path) -> Result<image::DynamicImage> {
 
 /// Re-encode the supplied image bytes (PNG/JPEG/etc) to PNG.
 ///
-/// Returns the encoded PNG bytes (`Vec<u8>`). Output length is dependent
-/// only on the image dimensions — content is decoupled from the original
-/// format choice. Caller writes them with the byte-perfect guarantees we
-/// already establish elsewhere.
+/// Returns encoded PNG bytes with the decoded pixel values and dimensions.
+/// Source-container metadata is not retained.
 pub fn convert_to_png(input: &Path) -> Result<Vec<u8>> {
     let img = ensure_decode(input)?;
     let mut out = Vec::with_capacity(64 * 1024);
@@ -72,10 +94,11 @@ pub fn convert_to_png(input: &Path) -> Result<Vec<u8>> {
 
 /// Re-encode the supplied image bytes to JPEG with the given quality.
 pub fn convert_to_jpeg(input: &Path, quality: FormatQuality) -> Result<Vec<u8>> {
+    let quality = FormatQuality::try_from(quality.0)?;
     let img = ensure_decode(input)?;
     let rgb = img.to_rgb8();
     let mut out = Vec::with_capacity(64 * 1024);
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.0);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.get());
     use image::ImageEncoder;
     encoder
         .write_image(
@@ -178,5 +201,21 @@ mod tests {
         assert_eq!(dec.width(), 2);
         assert_eq!(dec.height(), 2);
         assert_eq!(dec.color(), image::ColorType::Rgb8);
+    }
+
+    #[test]
+    fn jpeg_quality_rejects_values_outside_documented_range() {
+        let td = tempdir().unwrap();
+        let src = td.path().join("in.png");
+        std::fs::write(&src, make_png_bytes()).unwrap();
+        assert!(convert_to_jpeg(&src, FormatQuality(0)).is_err());
+        assert!(convert_to_jpeg(&src, FormatQuality(255)).is_err());
+        assert!(convert_to_jpeg(&src, FormatQuality(1)).is_ok());
+        assert!(convert_to_jpeg(&src, FormatQuality(100)).is_ok());
+        assert!(FormatQuality::try_from(0).is_err());
+        assert_eq!(FormatQuality::try_from(1).unwrap().get(), 1);
+        assert_eq!(FormatQuality::try_from(100).unwrap().get(), 100);
+        assert!(FormatQuality::try_from(101).is_err());
+        assert!(FormatQuality::try_from(255).is_err());
     }
 }

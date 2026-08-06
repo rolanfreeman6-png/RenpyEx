@@ -1,10 +1,15 @@
 //! Magic byte detection for verifying extracted files.
 //!
 //! Identification is based on the first bytes of a file, not its extension.
-//! This catches truncation, corruption, and mis-named files that would
-//! otherwise pass through extraction silently.
+//! Verification uses this bounded classification to reject supported
+//! extensions whose signatures disagree; it is not a full media decoder.
 
 use std::fmt;
+
+// Detection receives a bounded prefix from the walker. Text classification
+// is disabled for larger caller-provided buffers to keep this API a prefix
+// classifier rather than a full-file UTF-8 validator.
+const TEXT_SAMPLE_BYTES: usize = 4096;
 
 /// All file formats we recognise by magic bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,10 +109,7 @@ pub fn detect(data: &[u8]) -> Magic {
     }
 
     // WebP: "RIFF????WEBP"
-    if data.len() >= 12
-        && &data[..4] == b"RIFF"
-        && &data[8..12] == b"WEBP"
-    {
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         return Magic::WebP;
     }
 
@@ -146,8 +148,9 @@ pub fn detect(data: &[u8]) -> Magic {
         return Magic::Mp3Id3;
     }
 
-    // MP3 frame: 0xFF 0xFB / 0xFF 0xFA / etc.
-    if data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0 {
+    // MPEG audio frame header fields and reserved values are defined by
+    // ISO/IEC 11172-3 §2.4.1.3 and ISO/IEC 13818-3 §2.4.1.3.
+    if is_mpeg_audio_header(data) {
         return Magic::Mp3Frame;
     }
 
@@ -164,9 +167,9 @@ pub fn detect(data: &[u8]) -> Magic {
         return Magic::Rpa3;
     }
 
-    // Conservative plain-text hint: short sample, all printable ASCII,
+    // Conservative plain-text hint: bounded sample, all printable ASCII,
     // no NUL bytes.
-    if data.len() <= 64 && data.iter().all(|b| is_text_byte(*b)) {
+    if data.len() <= TEXT_SAMPLE_BYTES && data.iter().all(|b| is_text_byte(*b)) {
         return Magic::Text;
     }
 
@@ -193,6 +196,23 @@ pub fn detect_with_ext(data: &[u8], ext_hint: Option<&str>) -> Magic {
 
 const fn is_text_byte(b: u8) -> bool {
     b == b'\n' || b == b'\r' || b == b'\t' || (b >= 0x20 && b < 0x7F)
+}
+
+const fn is_mpeg_audio_header(data: &[u8]) -> bool {
+    if data.len() < 4 || data[0] != 0xFF || (data[1] & 0xE0) != 0xE0 {
+        return false;
+    }
+    let version = (data[1] >> 3) & 0b11;
+    let layer = (data[1] >> 1) & 0b11;
+    let bitrate_index = (data[2] >> 4) & 0b1111;
+    let sample_rate_index = (data[2] >> 2) & 0b11;
+    let emphasis = data[3] & 0b11;
+    version != 0b01
+        && layer != 0
+        && bitrate_index != 0
+        && bitrate_index != 0b1111
+        && sample_rate_index != 0b11
+        && emphasis != 0b10
 }
 
 #[cfg(test)]
@@ -278,7 +298,10 @@ mod tests {
 
     #[test]
     fn detects_matroska() {
-        assert_eq!(detect(&[0x1A, 0x45, 0xDF, 0xA3, 0x42, 0x86]), Magic::Matroska);
+        assert_eq!(
+            detect(&[0x1A, 0x45, 0xDF, 0xA3, 0x42, 0x86]),
+            Magic::Matroska
+        );
     }
 
     #[test]
@@ -291,6 +314,14 @@ mod tests {
         // 0xFF 0xFB (MPEG 1 layer 3) — sync word frame header
         let bytes = [0xFF, 0xFB, 0x90, 0x00];
         assert_eq!(detect(&bytes), Magic::Mp3Frame);
+    }
+
+    #[test]
+    fn rejects_truncated_or_reserved_mp3_headers() {
+        assert_eq!(detect(&[0xFF, 0xE0]), Magic::Unknown);
+        assert_eq!(detect(&[0xFF, 0xFB, 0x00, 0x00]), Magic::Unknown);
+        assert_eq!(detect(&[0xFF, 0xFB, 0xFC, 0x00]), Magic::Unknown);
+        assert_eq!(detect(&[0xFF, 0xEB, 0x90, 0x00]), Magic::Unknown);
     }
 
     #[test]
@@ -310,9 +341,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_binary_nul_after_sixteen_printable_bytes() {
+        let mut bytes = b"0123456789abcdef".to_vec();
+        bytes.push(0);
+        assert_eq!(detect(&bytes), Magic::Unknown);
+    }
+
+    #[test]
     fn rejects_text_over_long_limit() {
-        // Text detection is conservative: only short samples.
-        let big: Vec<u8> = b"a".repeat(100);
+        let big: Vec<u8> = b"a".repeat(TEXT_SAMPLE_BYTES + 1);
         assert_eq!(detect(&big), Magic::Unknown);
     }
 

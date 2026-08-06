@@ -32,7 +32,7 @@ const OVERLAY_ALPHA: u8 = 210;
 fn make_window_translucent(frame: &eframe::Frame) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
+        GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW,
         WS_EX_LAYERED,
     };
 
@@ -69,12 +69,16 @@ impl eframe::App for TranslucentApp {
         self.inner.clear_color(visuals)
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.inner.logic(ctx, frame);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if !self.styled {
             make_window_translucent(frame);
             self.styled = true;
         }
-        self.inner.update(ctx, frame);
+        self.inner.ui(ui, frame);
     }
 }
 
@@ -97,7 +101,7 @@ fn main() {
             // Borderless: the native frame would be excluded from the layered
             // alpha unevenly and looks out of place on an overlay. The toolbar
             // acts as the title bar (drag to move, ❌/🗕 buttons) — see
-            // `RenpyExApp::update`.
+            // `RenpyExApp::ui`.
             .with_decorations(false),
         ..Default::default()
     };

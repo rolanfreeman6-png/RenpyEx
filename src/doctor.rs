@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::possible_missing_else, clippy::collapsible_if)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -242,7 +242,7 @@ pub fn discover(input: &Path) -> Result<Project> {
 pub fn inspect(input: &Path) -> Result<Report> {
     let project = discover(input)?;
     let mut files = GameWalker::new(project.game.clone()).walk()?.files;
-    files.sort_by_key(|f| norm(&f.rel));
+    files.sort_by_cached_key(|file| (norm(&file.rel), path(&file.rel)));
     let archives: Vec<String> = files
         .iter()
         .filter(|f| ext(&f.rel, "rpa"))
@@ -362,8 +362,8 @@ struct Scan {
 }
 
 fn source_scan(files: &[FileEntry], archives: bool) -> Scan {
-    let direct: HashMap<String, &FileEntry> = files.iter().map(|f| (norm(&f.rel), f)).collect();
-    let mut refs: HashMap<String, Vec<Location>> = HashMap::new();
+    let direct: BTreeMap<String, &FileEntry> = files.iter().map(|f| (norm(&f.rel), f)).collect();
+    let mut refs: BTreeMap<String, Vec<Location>> = BTreeMap::new();
     let mut unsafe_paths = Vec::new();
     let mut dynamic = Vec::new();
     let mut used = BTreeSet::new();
@@ -441,6 +441,11 @@ fn source_scan(files: &[FileEntry], archives: bool) -> Scan {
                     });
             }
         }
+        if let Some(language) = language.as_deref()
+            && let Some(work) = translation_map.get_mut(language)
+        {
+            work.finish_pending();
+        }
     }
     let mut resolved = Vec::new();
     let mut missing = Vec::new();
@@ -503,6 +508,16 @@ struct TranslationWork {
     pending: Option<(String, u32, String)>,
     errors: Vec<(String, u32, String, String)>,
 }
+
+impl TranslationWork {
+    fn finish_pending(&mut self) {
+        if let Some((file, line, text)) = self.pending.take() {
+            self.missing += 1;
+            self.errors.push((file, line, text, "missing_new".into()));
+        }
+    }
+}
+
 fn scan_translation(
     all: &mut BTreeMap<String, TranslationWork>,
     lang: Option<&str>,
@@ -517,11 +532,7 @@ fn scan_translation(
         w.blocks += 1
     }
     if let Some(old) = quoted_after(t, "old") {
-        if let Some((old_file, old_line, previous)) = w.pending.take() {
-            w.missing += 1;
-            w.errors
-                .push((old_file, old_line, previous, "missing_new".into()));
-        }
+        w.finish_pending();
         w.old += 1;
         w.pending = Some((file.into(), line, old))
     }
@@ -540,16 +551,8 @@ fn scan_translation(
 fn finish_translations(all: BTreeMap<String, TranslationWork>) -> Translations {
     let mut languages = Vec::new();
     let mut errors = Vec::new();
-    for (lang, w) in all {
-        if let Some((f, l, old)) = w.pending {
-            errors.push(TranslationError {
-                language: lang.clone(),
-                file: f,
-                line: l,
-                kind: "missing_new".into(),
-                text: old,
-            })
-        }
+    for (lang, mut w) in all {
+        w.finish_pending();
         for (f, l, t, k) in w.errors {
             errors.push(TranslationError {
                 language: lang.clone(),
@@ -595,10 +598,7 @@ fn duplicate_groups(files: &[FileEntry], media: &[MediaRecord]) -> Vec<Duplicate
         let p = path(&f.rel);
         if valid.contains(p.as_str()) {
             if let Ok(digest) = sha256_file(&f.abs) {
-                groups
-                    .entry((f.size, to_hex(&digest)))
-                    .or_default()
-                    .push(p)
+                groups.entry((f.size, to_hex(&digest))).or_default().push(p)
             }
         }
     }
@@ -752,24 +752,33 @@ fn tl_language(p: &Path) -> Option<String> {
 }
 fn kind(s: &str) -> ReferenceKind {
     let l = s.to_ascii_lowercase();
-    if l.contains("play ") || l.contains("queue ") || l.contains("voice ") {
-        ReferenceKind::Audio
-    } else if l.contains("movie") || l.contains(".mp4") || l.contains(".webm") {
+    let head = statement_head(s);
+    if matches!(head, Some("play" | "queue"))
+        && (l.split_ascii_whitespace().nth(1) == Some("movie")
+            || l.contains(".mp4")
+            || l.contains(".webm"))
+    {
         ReferenceKind::Video
-    } else if l.trim_start().starts_with("image ") || l.contains("show ") || l.contains("scene ") {
+    } else if matches!(head, Some("play" | "queue" | "voice")) {
+        ReferenceKind::Audio
+    } else if matches!(head, Some("image" | "show" | "scene")) {
         ReferenceKind::Image
     } else {
         ReferenceKind::Displayable
     }
 }
 fn is_ref(s: &str) -> bool {
-    let l = s.to_ascii_lowercase();
-    l.contains("image ")
-        || l.contains("show ")
-        || l.contains("scene ")
-        || l.contains("play ")
-        || l.contains("queue ")
-        || l.contains("voice ")
+    matches!(
+        statement_head(s),
+        Some("image" | "show" | "scene" | "play" | "queue" | "voice")
+    )
+}
+fn statement_head(s: &str) -> Option<&str> {
+    let head = s.trim_start().split_ascii_whitespace().next()?;
+    match head {
+        "image" | "show" | "scene" | "play" | "queue" | "voice" => Some(head),
+        _ => None,
+    }
 }
 fn asset(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
@@ -893,11 +902,52 @@ mod tests {
         let d = tempdir().unwrap();
         fs::write(
             d.path().join("script.rpy"),
-            "label start:\n    \"A dialogue line that mentions image.png.\"\n",
+            "label start:\n    \"A dialogue line that mentions image.png.\"\n    e \"show images/missing.png\"\n",
         )
         .unwrap();
         let r = inspect(d.path()).unwrap();
         assert_eq!(r.summary.static_references, 0);
         assert_eq!(r.summary.missing_references, 0);
+    }
+
+    #[test]
+    fn terminal_old_string_increments_missing_count() {
+        let d = tempdir().unwrap();
+        let translation_dir = d.path().join("tl/french");
+        fs::create_dir_all(&translation_dir).unwrap();
+        fs::write(translation_dir.join("strings.rpy"), "old \"Hello\"\n").unwrap();
+
+        let report = inspect(d.path()).unwrap();
+
+        assert_eq!(report.translations.languages.len(), 1);
+        assert_eq!(report.translations.languages[0].missing_new, 1);
+        assert_eq!(report.translations.errors.len(), 1);
+        assert_eq!(report.translations.errors[0].kind, "missing_new");
+    }
+
+    #[test]
+    fn translation_pairs_do_not_cross_file_boundaries() {
+        let d = tempdir().unwrap();
+        let translation_dir = d.path().join("tl/french");
+        fs::create_dir_all(&translation_dir).unwrap();
+        fs::write(translation_dir.join("a.rpy"), "old \"from a\"\n").unwrap();
+        fs::write(translation_dir.join("b.rpy"), "new \"from b\"\n").unwrap();
+
+        let report = inspect(d.path()).unwrap();
+
+        let french = &report.translations.languages[0];
+        assert_eq!(french.old_strings, 1);
+        assert_eq!(french.new_strings, 1);
+        assert_eq!(french.missing_new, 1);
+        assert_eq!(report.translations.errors.len(), 1);
+        assert!(report.translations.errors[0].file.ends_with("a.rpy"));
+    }
+
+    #[test]
+    fn play_movie_is_classified_as_video() {
+        assert!(matches!(
+            kind("play movie \"video/opening.webm\""),
+            ReferenceKind::Video
+        ));
     }
 }

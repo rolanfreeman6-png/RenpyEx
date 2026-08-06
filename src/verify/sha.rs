@@ -116,6 +116,9 @@ mod tests {
     #[test]
     fn reader_hash_matches_in_memory_hash() {
         let mut data = std::io::Cursor::new(vec![0x5a; 100_000]);
-        assert_eq!(sha256_reader(&mut data).unwrap(), sha256(&vec![0x5a; 100_000]));
+        assert_eq!(
+            sha256_reader(&mut data).unwrap(),
+            sha256(&vec![0x5a; 100_000])
+        );
     }
 }

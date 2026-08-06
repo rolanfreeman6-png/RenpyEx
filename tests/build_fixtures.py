@@ -8,15 +8,14 @@ Run from repo root:
     python tests/build_fixtures.py
 
 Layout produced:
-    [header 35 bytes]        -- "RPA-3.0 " + offset_hex(16) + " " + key_hex(8) + " \n"
+    [header 34 bytes]        -- "RPA-3.0 " + offset_hex(16) + " " + key_hex(8) + "\n"
     [pad to 256 bytes]       -- zero-fill
     [data blocks]            -- entry payloads, contiguous
-    [zlib-compressed index]   -- pickeld dict mapping path -> [(offset, length)]
+    [zlib-compressed index]   -- pickled dict mapping path -> [(offset, length)]
 """
 from __future__ import annotations
 
 import pickle
-import struct
 import sys
 import zlib
 from pathlib import Path
@@ -33,7 +32,7 @@ def build_archive(out_path: Path) -> None:
 
     data_start = 0x100  # 256 bytes from file start (after header+pad block)
     # Lay out entries and build honest index.
-    index: dict[str, list[tuple[int, int]]] = {}
+    index: dict[str, list[tuple[int, int] | tuple[int, int, bytes]]] = {}
     cursor = data_start
     for path, payload in entries:
         index[path] = [(cursor, len(payload))]
@@ -48,16 +47,26 @@ def build_archive(out_path: Path) -> None:
     cursor += len(prefixed_tail)
     index_offset = cursor
 
-    # Pickle + zlib compress the index (we omit XOR obfuscation with key=0).
-    pickle_bytes = pickle.dumps(index)
+    # Source: Ren'Py launcher/game/archiver.rpy lines 49-83 at commit
+    # da4d86679ceca69124dc2204098e1245968c9aa0.
+    key = 0x42424242
+    encoded_index: dict[str, list[tuple[int, int] | tuple[int, int, bytes]]] = {}
+    for path, chunks in index.items():
+        encoded_chunks = []
+        for chunk in chunks:
+            if len(chunk) == 2:
+                offset, length = chunk
+                encoded_chunks.append((offset ^ key, length ^ key))
+            else:
+                offset, length, prefix = chunk
+                encoded_chunks.append((offset ^ key, length ^ key, prefix))
+        encoded_index[path] = encoded_chunks
+    pickle_bytes = pickle.dumps(encoded_index, protocol=4)
     compressed = zlib.compress(pickle_bytes, level=9)
-    key = 0
 
-    header_prefix = b" RPA-3.0 "
-    # Ren'Py uses b"RPA-3.0 " exactly (no leading space) — adjust.
-    header_prefix = b"RPA-3.0 "
-    header_body = f"{index_offset:016x}".encode("ascii") + b" " + f"{key:08x}".encode("ascii") + b" \n"
-    header = header_prefix + header_body
+    header = f"RPA-3.0 {index_offset:016x} {key:08x}\n".encode("ascii")
+    if len(header) != 34:
+        raise RuntimeError(f"Unexpected header length: {len(header)}")
     if len(header) > data_start:
         raise RuntimeError(f"Header too long: {len(header)}")
     pad = b"\x00" * (data_start - len(header))

@@ -62,7 +62,9 @@ pub enum RenpyExError {
     },
 
     /// Archive claims file size larger than expected or impossible.
-    #[error("file size mismatch in {archive} at entry {entry}: claimed {claimed}, available {available}")]
+    #[error(
+        "file size mismatch in {archive} at entry {entry}: claimed {claimed}, available {available}"
+    )]
     SizeMismatch {
         /// Containing archive.
         archive: PathBuf,

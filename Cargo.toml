@@ -1,7 +1,8 @@
 [package]
 name = "renpyex"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
+rust-version = "1.95"
 description = "Ren'Py archive extractor with byte-perfect extraction and integrity verification"
 license = "MIT"
 authors = ["RenpyEx contributors"]
@@ -34,9 +35,9 @@ sha2 = "0.10"
 thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 flate2 = "1"
-egui = { version = "0.29.1", optional = true }
-eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"], optional = true }
-rfd = { version = "0.15", optional = true }
+egui = { version = "0.36", optional = true }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"], optional = true }
+rfd = { version = "0.17.2", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -4,8 +4,8 @@
 //!
 //! If Python or unrpyc is not present, we fall back to detecting the file
 //! as a `.rpyc` (via extension hint) and reporting the user should install
-//! `unrpyc` if they want source extraction. The `.rpyc` itself is still
-//! extracted byte-perfect under all conditions.
+//! `unrpyc` if they want source extraction. The extraction workflow copies
+//! the original `.rpyc` before optional decompilation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,8 +24,8 @@ pub struct RpycDecompileOptions {
     pub overwrite_rpyc: bool,
 }
 
-/// Locate an `unrpyc` invocation we can use. Returns the python executable
-/// name and the candidate script command.
+/// Locate an `unrpyc` invocation we can use. Returns the Python executable
+/// name and the resolved script/executable path.
 #[must_use]
 pub fn find_unrpyc(opts: &RpycDecompileOptions) -> Option<(String, String)> {
     let py = opts.python.clone().unwrap_or_else(|| {
@@ -40,12 +40,21 @@ pub fn find_unrpyc(opts: &RpycDecompileOptions) -> Option<(String, String)> {
         return Some((py, script));
     }
     let probe = if cfg!(windows) { "where" } else { "which" };
-    std::process::Command::new(probe)
+    let output = std::process::Command::new(probe)
         .arg(&script)
         .output()
         .ok()
-        .filter(|output| output.status.success())
-        .map(|_| (py, script))
+        .filter(|output| output.status.success())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resolved = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .to_owned();
+    let resolved_path = PathBuf::from(resolved);
+    resolved_path
+        .is_file()
+        .then(|| (py, resolved_path.to_string_lossy().into_owned()))
 }
 
 /// Reject unsafe in-place decompilation.
@@ -85,17 +94,25 @@ pub fn decompile_rpyc_to(
             destination_rpyc.display()
         )));
     }
-    if let Some(parent) = destination_rpyc.parent() {
-        fs::create_dir_all(parent).map_err(|e| RenpyExError::io(parent, e))?;
-    }
-    fs::copy(source, destination_rpyc).map_err(|e| RenpyExError::io(destination_rpyc, e))?;
+    crate::output::copy_atomic(source, destination_rpyc)?;
     let sidecar = destination_rpyc.with_extension("rpy");
     let (python, unrpyc) = match find_unrpyc(opts) {
         Some(value) => value,
         None => return Ok(None),
     };
-    let mut command = std::process::Command::new(&python);
-    command.arg(&unrpyc).arg(destination_rpyc);
+    let unrpyc_path = Path::new(&unrpyc);
+    let is_python_script = unrpyc_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("py"));
+    let mut command = if is_python_script {
+        let mut command = std::process::Command::new(&python);
+        command.arg(unrpyc_path);
+        command
+    } else {
+        std::process::Command::new(unrpyc_path)
+    };
+    command.arg(destination_rpyc);
     if opts.overwrite_rpyc {
         let _ = fs::remove_file(&sidecar);
         command.arg("--clobber");
@@ -105,12 +122,12 @@ pub fn decompile_rpyc_to(
         .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|error| RenpyExError::External {
-            tool: format!("{python}/{unrpyc}"),
+            tool: unrpyc.clone(),
             message: error.to_string(),
         })?;
     if !output.status.success() {
         return Err(RenpyExError::External {
-            tool: format!("{python}/{unrpyc}"),
+            tool: unrpyc,
             message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }

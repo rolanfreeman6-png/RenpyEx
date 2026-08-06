@@ -10,7 +10,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use renpyex::archive::{Length, Offset, RpaEntry, list_rpa, read_entry};
+use renpyex::RenpyExError;
+use renpyex::archive::{Length, Offset, RpaEntry, extract_rpa, list_rpa, read_entry};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.rpa")
@@ -19,12 +20,11 @@ fn fixture() -> PathBuf {
 /// Owns a tempdir alive while we return the contained path.
 fn tmp_copy(suffix: &str) -> (PathBuf, tempfile::TempDir) {
     let src = fixture();
-    if !src.exists() {
-        panic!(
-            "fixture missing: {}. Run `python tests/build_fixtures.py` first.",
-            src.display()
-        );
-    }
+    assert!(
+        src.exists(),
+        "fixture missing: {}. Run `python tests/build_fixtures.py` first.",
+        src.display()
+    );
     let data = fs::read(&src).expect("read fixture");
     let dir = tempfile::tempdir().expect("tempdir");
     let dst = dir.path().join(format!("sample{suffix}.rpa"));
@@ -32,97 +32,89 @@ fn tmp_copy(suffix: &str) -> (PathBuf, tempfile::TempDir) {
     (dst, dir)
 }
 
-#[test]
-fn mutation_truncated_rpa_fails_cleanly() {
-    let path = fixture();
-    if !path.exists() {
-        return;
-    }
-    let data = fs::read(&path).expect("read");
-    let truncated = path.with_extension("truncated.rpa");
-    fs::write(&truncated, &data[..data.len() / 2]).expect("write truncated");
-    let result = list_rpa(&truncated, None);
-    // Invariant: NEVER panic, NEVER a successful list with bad data.
-    if let Ok(listed) = &result {
-        let half = (data.len() / 2) as u64;
-        assert!(
-            listed.entries.is_empty()
-                || listed
-                    .entries
-                    .iter()
-                    .all(|e| e.offset.get() + e.length.get() <= half),
-            "extraction reported entries whose offsets fall outside the truncated file"
-        );
-    }
-    let _ = fs::remove_file(&truncated);
+fn write_archive_with_path(path: &std::path::Path, archived_path: &str) {
+    let script = r#"
+import pickle, sys, zlib
+name = sys.argv[2]
+payload = b"payload"
+key = 0x42424242
+data_offset = 34
+index_offset = data_offset + len(payload)
+index = {name: [(data_offset ^ key, len(payload) ^ key)]}
+header = f"RPA-3.0 {index_offset:016x} {key:08x}\n".encode("ascii")
+assert len(header) == 34
+open(sys.argv[1], "wb").write(header + payload + zlib.compress(pickle.dumps(index, protocol=2)))
+"#;
+    // Supported test targets: Windows, Linux, macOS. RPA parsing itself has
+    // the same Python 3 runtime requirement, so the fixture uses that runtime.
+    let status = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .arg(archived_path)
+        .status()
+        .expect("launch Python fixture builder");
+    assert!(status.success(), "Python fixture builder failed");
 }
 
 #[test]
-fn mutation_flip_header_byte_fails_or_succeeds_noticeably() {
-    let path = fixture();
-    if !path.exists() {
-        return;
-    }
-    let mut data = fs::read(&path).expect("read fixture");
+fn mutation_truncated_rpa_fails_cleanly() {
+    let (truncated, _guard) = tmp_copy("_truncated");
+    let data = fs::read(&truncated).expect("read");
+    fs::write(&truncated, &data[..data.len() / 2]).expect("write truncated");
+    let error = list_rpa(&truncated, None).expect_err("truncated index must fail");
+    assert!(matches!(error, RenpyExError::SizeMismatch { .. }));
+}
+
+#[test]
+fn mutation_flip_header_byte_returns_bad_magic() {
+    let mut data = fs::read(fixture()).expect("read fixture");
     data[0] ^= 0xFF;
     let (dst, _guard) = tmp_copy("_flipped");
     fs::write(&dst, &data).expect("write");
-    let result = list_rpa(&dst, None);
-    if let Ok(listed) = &result {
-        // If it did happen to succeed (unlikely with a header byte flipped),
-        // the entries must still be coherent.
-        let original = list_rpa(&path, None).expect("original ok");
-        assert_eq!(listed.entries.len(), original.entries.len());
-    }
+    let error = list_rpa(&dst, None).expect_err("corrupt magic must fail");
+    assert!(matches!(error, RenpyExError::BadMagic { .. }));
 }
 
 #[test]
-fn mutation_zero_length_entry_rejected() {
-    // Zero-length entries are valid and must not panic.
-    assert_eq!(Length::new(0).get(), 0);
-
-    // Offset construction must not silently alter archived values.
-    let big = Offset::new(u64::MAX);
-    assert_eq!(big.get(), u64::MAX);
+fn zero_length_entry_reads_as_exact_empty_payload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = temp.path().join("empty.rpa");
+    fs::write(&archive, []).expect("write empty archive body");
+    let entry = RpaEntry {
+        path: "empty.bin".into(),
+        offset: Offset::new(0),
+        length: Length::new(0),
+        prefix: None,
+    };
+    assert_eq!(read_entry(&archive, &entry).unwrap(), Vec::<u8>::new());
 }
 
 #[test]
-fn mutation_completely_garbage_input_does_not_panic() {
+fn mutation_completely_garbage_input_returns_bad_magic() {
     let (dst, _guard) = tmp_copy("_garbage");
     let garbage: Vec<u8> = (0..2048).map(|i| (i * 31) as u8).collect();
     fs::write(&dst, &garbage).expect("write");
-    let _ = list_rpa(&dst, None);
+    let error = list_rpa(&dst, None).expect_err("garbage must fail");
+    assert!(matches!(error, RenpyExError::BadMagic { .. }));
 }
 
 #[test]
-fn safe_path_rejects_traversal_payload() {
-    use renpyex::archive::extract_rpa;
-    let path = fixture();
-    if !path.exists() {
-        return;
-    }
-    let outdir = std::env::temp_dir().join(format!("renpyexmut_{}", std::process::id()));
-    let _ = fs::create_dir_all(&outdir);
-    let _ = extract_rpa(&path, &outdir, None);
-    // Verify directly that read_entry with a fake traversal path returns
-    // an error (not panics), since path-traversal filter in extract_rpa only
-    // rejects at extraction time, not construction.
-    let bad = RpaEntry {
-        path: "../escape".into(),
-        offset: Offset::new(0),
-        length: Length::new(1),
-        prefix: None,
-    };
-    let _ = extract_rpa(&path, &outdir, None);
-    let _ = fs::write(outdir.join("body"), b"ok");
-    let _ = bad; // referenced to silence dead_code
-    let _ = read_entry(
-        &path,
-        &RpaEntry {
-            path: "../escape".into(),
-            offset: Offset::new(0),
-            length: Length::new(1),
-            prefix: None,
-        },
+fn malicious_archive_path_is_rejected_before_any_write() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = temp.path().join("traversal.rpa");
+    let output = temp.path().join("output");
+    let escaped = temp.path().join("escape.txt");
+    write_archive_with_path(&archive, "../escape.txt");
+
+    let error = extract_rpa(&archive, &output, None).expect_err("traversal must fail");
+    assert!(matches!(
+        error,
+        RenpyExError::PathTraversal { ref entry, .. } if entry == "../escape.txt"
+    ));
+    assert!(!escaped.exists(), "archive wrote outside output root");
+    assert!(
+        !output.exists() || fs::read_dir(&output).unwrap().next().is_none(),
+        "traversal preflight left partial output"
     );
 }

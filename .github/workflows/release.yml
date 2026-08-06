@@ -38,6 +38,11 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      - name: Install Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Validate tag and package version
         shell: pwsh
         env:
@@ -48,7 +53,7 @@ jobs:
             throw "Release tag must match vMAJOR.MINOR.PATCH, got '$env:RELEASE_TAG'"
           }
 
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $package = @($metadata.packages | Where-Object { $_.name -eq 'renpyex' })
           if ($package.Count -ne 1) {
             throw "Expected exactly one renpyex package, found $($package.Count)"
@@ -62,29 +67,29 @@ jobs:
           "RELEASE_TAG=$env:RELEASE_TAG" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RELEASE_VERSION=$expectedVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Check formatting of changed Rust files
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $rustFiles = @(git diff --name-only HEAD^ HEAD -- '*.rs')
-          foreach ($file in $rustFiles) {
-            rustfmt --edition 2024 --check $file
-          }
-          if ($rustFiles.Count -eq 0) {
-            Write-Host 'No Rust files changed in the release commit.'
-          }
+      - name: Check repository formatting
+        run: cargo fmt --all -- --check
 
       - name: Build deterministic RPA fixtures
-        run: python tests/build_fixtures.py
+        shell: pwsh
+        run: |
+          python tests/build_fixtures.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "Fixture generator failed with exit code $LASTEXITCODE"
+          }
+          git diff --exit-code -- tests/fixtures/sample.rpa
+          if ($LASTEXITCODE -ne 0) {
+            throw "tests/fixtures/sample.rpa is not reproducible"
+          }
 
       - name: Run tests with GUI feature
-        run: cargo test --all-targets --features gui
+        run: cargo test --all-targets --all-features --locked
 
       - name: Run clippy with warnings denied
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Build release binaries
-        run: cargo build --release --features gui --bin renpyex --bin renpyex-gui
+        run: cargo build --release --all-features --locked --bin renpyex --bin renpyex-gui
 
       - name: Smoke-test release binaries
         shell: pwsh

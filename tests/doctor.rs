@@ -23,3 +23,29 @@ fn doctor_json_is_parseable_when_findings_exist() {
     assert_eq!(report["summary"]["dynamic_references"], 1);
     assert!(!output.stderr.is_empty());
 }
+
+#[test]
+fn doctor_json_is_byte_deterministic_across_processes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let game = temp.path().join("game");
+    std::fs::create_dir_all(game.join("images")).expect("create game");
+    std::fs::write(
+        game.join("script.rpy"),
+        "image z = \"images/z.png\"\nimage a = \"images/a.png\"\n",
+    )
+    .expect("write source");
+
+    let mut baseline = None;
+    for _ in 0..8 {
+        let output = Command::new(env!("CARGO_BIN_EXE_renpyex"))
+            .args(["doctor", game.to_str().expect("utf8 path"), "--json"])
+            .output()
+            .expect("run doctor");
+        assert!(!output.status.success());
+        if let Some(expected) = &baseline {
+            assert_eq!(&output.stdout, expected, "Doctor JSON changed between runs");
+        } else {
+            baseline = Some(output.stdout);
+        }
+    }
+}

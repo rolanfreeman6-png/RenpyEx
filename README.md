@@ -2,12 +2,11 @@
 
 # ⚔️ RenpyEx
 
-**Ren'Py project doctor, byte-perfect extractor, verifier, and converter — pure Rust.**
+**Ren'Py project doctor, extractor, verifier, and converter — Rust CLI/GUI with isolated Python index parsing.**
 
 [![Release](https://img.shields.io/github/v/release/rolanfreeman6-png/RenpyEx?style=flat-square&color=ffd166)](https://github.com/rolanfreeman6-png/RenpyEx/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-90_passing-brightgreen?style=flat-square)](#-quality)
 
 *Inspect, extract, verify, and convert Ren'Py game assets — with byte-perfect
 copy paths and explicit read-only health checks.*
@@ -22,9 +21,9 @@ copy paths and explicit read-only health checks.*
 
 | | Feature | Description |
 |---|---|---|
-| 📦 | **Byte-perfect extraction** | Every emitted byte equals the byte inside the source archive — no silent re-encoding, ever |
-| 🔐 | **SHA-256 integrity** | `verify` re-hashes every file against a `SHA256SUMS.txt` (coreutils-compatible format) to prove nothing was tampered with |
-| 🔍 | **Magic-byte sniffing** | PNG, JPEG, GIF, WebP, BMP, OGG, WAV, MP3, FLAC, Matroska, MP4/M4A recognised by their first bytes; truncated or misnamed files get flagged |
+| 📦 | **Byte-perfect extraction** | Copy and RPA extraction paths preserve source payload bytes; conversion and decompilation remain explicit opt-ins |
+| 🔐 | **SHA-256 integrity** | `verify` re-hashes every manifest entry, rejects extension/signature mismatches, and parses recognized image headers for dimensions |
+| 🔍 | **Magic-byte sniffing** | PNG, JPEG, GIF, WebP, BMP, OGG, WAV, MP3, FLAC, Matroska, MP4/M4A are classified from bounded prefixes; this is not full audio/video decoding |
 | 🖼️ | **Image conversion** | Opt-in `convert` re-emits decodable images as PNG or JPEG (quality-adjustable) |
 | 🧠 | **Streaming SHA-256** | Verification, manifests, and duplicate checks process large files in fixed-size chunks |
 | 🩺 | **Project Doctor** | Read-only JSON/text audit for media signatures, static asset paths, translation structure, duplicate media, and orphan candidates |
@@ -40,13 +39,14 @@ Grab the latest Windows binaries from the
 - `renpyex.exe` — command-line tool
 - `renpyex-gui.exe` — desktop GUI
 
-No installer, no runtime dependencies. Python is only needed if you want
-optional `.rpyc` decompilation (via `unrpyc`).
+No installer is required. Python 3 is required for `.rpa` unpacking because
+Ren'Py stores archive indexes as Python pickles; optional `.rpyc` decompilation
+also requires a compatible `unrpyc` script or executable.
 
 ## 🚀 Quick start
 
 ```text
-renpyex 0.2.0 — Ren'Py project health and extraction
+renpyex 0.2.1 — Ren'Py project health and extraction
 
 USAGE:
     renpyex <info|extract|verify|convert|doctor|sdk> [OPTIONS]
@@ -98,15 +98,18 @@ extraction/verification/conversion code stays the single source of truth.
 - 🪟 **Translucent overlay window** — borderless, blended with your desktop
   at the OS level (`WS_EX_LAYERED`); drag the toolbar to move, double-click
   it to maximize, 🗕/❌ buttons top-right
-- ⚙️ **Everything the CLI does** — Scan / Extract / Verify / Convert / Doctor, path
-  pickers, `.rpa` unpacking, optional `.rpyc` decompile, XOR key entry,
-  JPEG quality slider
-- 🧵 **Never freezes** — long operations run on a background thread; the
-  color-coded log streams into the central pane
+- ⚙️ **Five local operations** — Scan / Extract / Verify / Convert / Doctor,
+  path pickers, `.rpa` unpacking, optional `.rpyc` decompile, XOR key entry,
+  and a JPEG quality slider; SDK commands remain CLI-only
+- 🧵 **Background execution** — the status bar receives live progress events;
+  the complete color-coded terminal log is appended when the operation ends
 - 💾 **Remembers your paths** — persisted to `%APPDATA%\renpyex\config.json`
   (Windows) or `$XDG_CONFIG_HOME/renpyex/config.json` (Linux/macOS)
 
 ## 🛠️ Build from source
+
+Rust 1.95 or newer is required. Python 3 is required to regenerate fixtures
+and to run RPA extraction tests.
 
 ```bash
 # CLI (lean — no GUI dependencies)
@@ -124,6 +127,28 @@ renpyex-gui --probe
 The default `cargo build` / `cargo test` do **not** compile the GUI stack,
 so the core CLI stays lean.
 
+### Runtime limits and manifest format
+
+RPA parsing applies explicit resource limits: 64 MiB compressed and 128 MiB
+decompressed indexes, 1,000,000 paths, 2,000,000 chunks, 4,096 UTF-8 bytes per
+path, and 16 MiB per inline prefix. The pickle helper has a 120-second timeout
+(10 seconds for its startup preflight), with stdout/stderr capped at
+256 MiB/1 MiB. Archive payload extraction is streamed; the library's direct
+in-memory single-entry API is capped at 512 MiB.
+
+SDK commands default to `--timeout 1800` seconds and cap stdout and stderr at
+16 MiB each. On timeout RenpyEx terminates the launched process group/tree and
+returns an error.
+
+`SHA256SUMS.txt` uses a deliberately portable UTF-8 subset: normalized relative
+paths with `/` separators and standard 64-hex SHA-256 records. Absolute paths,
+traversal, exact duplicates, file/directory conflicts, case-only aliases on
+Windows/macOS, empty/dot/repeated components, and escaped or non-UTF filenames
+are rejected. It is not a complete implementation of coreutils filename
+escaping. Extraction reserves the output root's `SHA256SUMS.txt` for its
+generated manifest and rejects an input that would map to that path before
+creating or clearing the output directory.
+
 ### Test fixtures
 
 ```bash
@@ -137,19 +162,17 @@ magic → 16-hex offset → key → zlib-compressed pickled index).
 
 ## 🧪 Quality
 
-- ✅ **90 tests, 0 failures** on `cargo test --all-targets --features gui` — unit tests,
-  CLI smoke test, GUI smoke test, and mutation tests
-- ✅ **MIHell-0.1-pc black-box test** — release CLI extracted all 3 RPA archives
-  (`1,158/1,158` entries byte-for-byte), verified `1,182/1,182` output files,
-  converted RGBA PNGs to both PNG and JPEG, and decompiled a real `.rpyc` with
-  external `unrpyc`.
-- 🧬 **Mutation testing**: `tests/mutations.rs` deliberately corrupts real
-  Ren'Py-formatted bytes (truncation, magic flips, garbage input, `..`
-  traversal payloads) and asserts the parser fails with a structured error —
-  never panics, never emits wrong bytes silently, never writes outside the
-  output directory
-- 🚫 **Zero clippy warnings** under `correctness = deny`, `style`,
-  `complexity`, `suspicious` — across the library, CLI, GUI, and tests
+- ✅ **Release gates**: deterministic fixture regeneration, repository-wide
+  rustfmt, all-target/all-feature tests, clippy with warnings denied, release
+  builds, and CLI/GUI probes
+- 🌐 **Cross-platform CI**: the same tests and release builds run on current
+  GitHub-hosted Windows, Linux, and macOS images
+- 🧬 **Adversarial coverage**: tests exercise official RPA2/RPA3 layouts,
+  nonzero XOR keys, legacy names, fragments, resource boundaries, traversal,
+  destination collisions, partial failures, process timeouts, and deterministic
+  Doctor JSON
+- 🚫 **Clippy warnings denied** under `correctness`, `style`, `complexity`,
+  and `suspicious` across the library, CLI, GUI, and tests
 - 🔒 **`unsafe` locked down**: denied crate-wide; the single exception is
   the GUI's documented Win32 layered-window setup
 - 🧱 **Explicit archive invariants**: `Offset(u64)` / `Length(u64)` newtypes

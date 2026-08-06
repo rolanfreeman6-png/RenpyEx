@@ -2,19 +2,16 @@
 //! [`crate::cli`] uses, but accumulating a log `String` instead of printing
 //! to stdout/stderr, so the GUI can render (and colorize) it in-app.
 //!
-//! Unlike the CLI (which signals partial per-file failures via a non-zero
-//! exit code), these functions return `Ok(log)` even when individual files
-//! failed — the failure count is embedded in the log text and surfaced to
-//! the user via [`crate::gui::app`]'s log colorizer. Only a hard, whole-job
-//! failure (bad output directory, unreadable game directory, ...) is
-//! propagated as `Err`.
+//! Partial per-file failures are returned as [`RenpyExError::Integrity`],
+//! matching the CLI's non-zero outcome instead of reporting a completed job.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::Result;
 use crate::archive::{
-    self, GameWalker, RpycDecompileOptions, decompile_rpyc_to, extract_rpa, list_rpa,
+    self, GameWalker, RpycDecompileOptions, decompile_rpyc_to, ensure_python_available,
+    extract_rpa, list_rpa,
 };
 use crate::convert::{ConvertTarget, FormatQuality, convert_to_jpeg, convert_to_png};
 use crate::error::RenpyExError;
@@ -30,7 +27,7 @@ pub struct OpSettings {
     pub include_rpa: bool,
     /// Try to decompile `.rpyc` files via Python `unrpyc`.
     pub decompile_rpyc: bool,
-    /// Optional XOR key (hex) for `.rpa` archives.
+    /// Override the header XOR key for a nonstandard `.rpa` archive.
     pub key: Option<String>,
     /// Target format for `convert`.
     pub convert_to: ConvertTarget,
@@ -53,9 +50,15 @@ impl Default for OpSettings {
 
 /// Enumerate files in `source` and summarize by classified magic bytes.
 pub fn scan(source: &Path) -> Result<String> {
+    scan_with_progress(source, &mut |_| {})
+}
+
+pub(crate) fn scan_with_progress(source: &Path, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let mut log = String::new();
     let game_dir = archive::walker::resolve_game_dir(source);
+    progress("walking source files");
     let inv = GameWalker::new(game_dir.clone()).walk()?;
+    progress(&format!("classified {} files", inv.files.len()));
     let _ = writeln!(log, "Game directory: {}", game_dir.display());
     let _ = writeln!(log, "Files: {}", inv.files.len());
     let _ = writeln!(log, "Total bytes: {}", inv.total_bytes);
@@ -103,11 +106,43 @@ pub fn scan(source: &Path) -> Result<String> {
 
 /// Walk `source` and copy files byte-perfect to `output`, honoring `settings`.
 pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<String> {
+    extract_with_progress(source, output, settings, &mut |_| {})
+}
+
+pub(crate) fn extract_with_progress(
+    source: &Path,
+    output: &Path,
+    settings: &OpSettings,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
     let mut log = String::new();
     let game_dir = archive::walker::resolve_game_dir(source);
     output::reject_output_within_source(&game_dir, output)?;
-    output::prepare_output(output, settings.overwrite)?;
+    progress("walking source files");
     let inv = GameWalker::new(game_dir.clone()).walk()?;
+    output::preflight_extraction_destinations(
+        output,
+        inv.files.iter().map(|file| file.rel.as_path()),
+        settings.include_rpa,
+        settings.decompile_rpyc,
+    )?;
+    let has_rpa = inv.files.iter().any(|file| {
+        file.rel
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rpa"))
+    });
+    let parsed_key = if settings.include_rpa {
+        let key = parse_user_key(settings.key.as_deref())?;
+        if has_rpa {
+            ensure_python_available()?;
+        }
+        key
+    } else {
+        None
+    };
+    output::prepare_output(output, settings.overwrite)?;
+    progress(&format!("copying {} files", inv.files.len()));
     let _ = writeln!(
         log,
         "Walking {} ({} files)…",
@@ -118,16 +153,7 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
     let mut failures: Vec<String> = Vec::new();
     let total = inv.files.len();
     for file in &inv.files {
-        let is_archive = matches!(file.magic, Magic::Rpa3)
-            || file
-                .rel
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("rpa"));
-        if is_archive && !settings.include_rpa {
-            continue;
-        }
-        let dest = match safe_join(output, &file.rel.to_string_lossy()) {
+        let dest = match output::safe_join_path(output, &file.rel) {
             Ok(p) => p,
             Err(e) => {
                 failures.push(format!("{}: {e}", file.rel.display()));
@@ -145,6 +171,7 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
         }
     }
     let _ = writeln!(log, "Copied {total} files.");
+    progress(&format!("processed {total} copy operations"));
 
     if settings.include_rpa {
         for file in &inv.files {
@@ -154,7 +181,7 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case("rpa"))
             {
-                let parsed_key = parse_user_key(settings.key.as_deref())?;
+                progress(&format!("unpacking {}", file.rel.display()));
                 let dest = output.join("rpa").join(&file.rel);
                 if let Some(parent) = dest.parent()
                     && let Err(err) = std::fs::create_dir_all(parent)
@@ -185,7 +212,8 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
             if file.rel.extension().and_then(|s| s.to_str()) != Some("rpyc") {
                 continue;
             }
-            let dest = safe_join(output, &file.rel.to_string_lossy())?;
+            progress(&format!("decompiling {}", file.rel.display()));
+            let dest = output::safe_join_path(output, &file.rel)?;
             match decompile_rpyc_to(&file.abs, &dest, &opts) {
                 Ok(Some(rpy)) => {
                     let _ = writeln!(
@@ -204,12 +232,18 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
     }
 
     if failures.is_empty() {
+        progress("writing SHA256SUMS.txt");
+        let manifest = output.join("SHA256SUMS.txt");
+        verify::emit_sums(output, &manifest)?;
+        let _ = writeln!(log, "Manifest: {}", manifest.display());
         let _ = writeln!(log, "Done. Wrote {total} files.");
     } else {
+        progress(&format!("{} extraction failures", failures.len()));
         let _ = writeln!(log, "Done with {} failures.", failures.len());
         for f in &failures {
             let _ = writeln!(log, "  {f}");
         }
+        return Err(RenpyExError::Integrity { message: log });
     }
     Ok(log)
 }
@@ -217,12 +251,22 @@ pub fn extract(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
 /// Re-hash every file in `sums` (defaults to `<source>/SHA256SUMS.txt`)
 /// against the actual contents of `source`.
 pub fn verify(source: &Path, sums: Option<&Path>) -> Result<String> {
+    verify_with_progress(source, sums, &mut |_| {})
+}
+
+pub(crate) fn verify_with_progress(
+    source: &Path,
+    sums: Option<&Path>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
     let mut log = String::new();
     let sums_path = sums
         .map(Path::to_path_buf)
         .unwrap_or_else(|| source.join("SHA256SUMS.txt"));
+    progress(&format!("verifying {}", sums_path.display()));
     let (ok, bad) = verify::verify_all(source, &sums_path)?;
     let total = ok + bad.len() as u64;
+    progress(&format!("verified {ok} of {total} files"));
     let _ = writeln!(
         log,
         "Verified {} / {} files in {}",
@@ -246,22 +290,70 @@ pub fn verify(source: &Path, sums: Option<&Path>) -> Result<String> {
                     actual
                 );
             }
+            verify::VerifyOutcome::FormatMismatch {
+                path,
+                expected,
+                detected,
+                message,
+            } => {
+                let _ = writeln!(
+                    log,
+                    "  INVALID FORMAT {}\n    expected: {}\n    detected: {}\n    detail:   {}",
+                    path.display(),
+                    expected,
+                    detected,
+                    message
+                );
+            }
             verify::VerifyOutcome::Missing { path } => {
                 let _ = writeln!(log, "  MISSING {}", path.display());
             }
         }
+    }
+    if !bad.is_empty() {
+        return Err(RenpyExError::Integrity { message: log });
     }
     Ok(log)
 }
 
 /// Re-emit decode-able images from `source` as PNG or JPEG into `output`.
 pub fn convert(source: &Path, output: &Path, settings: &OpSettings) -> Result<String> {
+    convert_with_progress(source, output, settings, &mut |_| {})
+}
+
+pub(crate) fn convert_with_progress(
+    source: &Path,
+    output: &Path,
+    settings: &OpSettings,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
     let mut log = String::new();
     let game_dir = archive::walker::resolve_game_dir(source);
     output::reject_output_within_source(&game_dir, output)?;
-    output::prepare_output(output, settings.overwrite)?;
-
+    progress("walking source files");
     let inv = GameWalker::new(game_dir).walk()?;
+    let target_extension = match settings.convert_to {
+        ConvertTarget::Png => "png",
+        ConvertTarget::Jpeg => "jpg",
+    };
+    let jpeg_quality = match settings.convert_to {
+        ConvertTarget::Png => FormatQuality::default(),
+        ConvertTarget::Jpeg => FormatQuality::try_from(settings.jpeg_quality)?,
+    };
+    let mut destinations = output::DestinationRegistry::new(output);
+    for file in &inv.files {
+        if matches!(
+            file.magic,
+            Magic::Png | Magic::Jpeg | Magic::Gif | Magic::WebP | Magic::Bmp
+        ) {
+            let dest_rel = file.rel.with_extension(target_extension);
+            let dest = output::safe_join_path(output, &dest_rel)?;
+            destinations.claim(file.rel.display().to_string(), &dest)?;
+        }
+    }
+    output::prepare_output(output, settings.overwrite)?;
+    progress("conversion preflight complete");
+
     let mut converted = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -275,21 +367,19 @@ pub fn convert(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
             skipped += 1;
             continue;
         }
-        let dest_rel = file.rel.with_extension(match settings.convert_to {
-            ConvertTarget::Png => "png",
-            ConvertTarget::Jpeg => "jpg",
-        });
-        let dest = match safe_join(output, &dest_rel.to_string_lossy()) {
+        let dest_rel = file.rel.with_extension(target_extension);
+        let dest = match output::safe_join_path(output, &dest_rel) {
             Ok(p) => p,
             Err(e) => {
                 let _ = writeln!(log, "  convert fail {}: {e}", file.rel.display());
                 failed += 1;
+                progress(&format!("failed to convert {}", file.rel.display()));
                 continue;
             }
         };
         let res = match settings.convert_to {
             ConvertTarget::Png => convert_to_png(&file.abs),
-            ConvertTarget::Jpeg => convert_to_jpeg(&file.abs, FormatQuality(settings.jpeg_quality)),
+            ConvertTarget::Jpeg => convert_to_jpeg(&file.abs, jpeg_quality),
         };
         let bytes = match res {
             Ok(b) => b,
@@ -302,14 +392,22 @@ pub fn convert(source: &Path, output: &Path, settings: &OpSettings) -> Result<St
         if let Err(e) = output::write_atomic(&dest, &bytes) {
             let _ = writeln!(log, "  write fail {}: {e}", dest.display());
             failed += 1;
+            progress(&format!("failed to write {}", dest.display()));
             continue;
         }
         converted += 1;
+        if converted.is_multiple_of(50) {
+            progress(&format!("converted {converted} images"));
+        }
     }
+    progress(&format!("converted {converted} images; {failed} failures"));
     let _ = writeln!(
         log,
         "Converted: {converted}, skipped (non-image): {skipped}, failed: {failed}"
     );
+    if failed > 0 {
+        return Err(RenpyExError::Integrity { message: log });
+    }
     Ok(log)
 }
 
@@ -331,35 +429,6 @@ fn parse_user_key(s: Option<&str>) -> Result<Option<u32>> {
         .map_err(|_| RenpyExError::Invalid("key must fit in u32".into()))
 }
 
-/// Sanitize and join `out_root` + `rel`, rejecting `..` traversal.
-///
-/// Duplicated (small) from `cli.rs`'s private helper of the same shape,
-/// since that one isn't `pub`: both preserve the same no-traversal
-/// invariant, just for the two independent front ends.
-fn safe_join(out_root: &Path, rel: &str) -> Result<PathBuf> {
-    let mut joined = out_root.to_path_buf();
-    let normalised = rel.replace('\\', "/");
-    if normalised.starts_with('/') || normalised.starts_with("//") {
-        return Err(RenpyExError::PathTraversal {
-            archive: out_root.to_path_buf(),
-            entry: rel.to_string(),
-        });
-    }
-    for piece in normalised.split('/').filter(|s| !s.is_empty()) {
-        match piece {
-            "." => continue,
-            ".." => {
-                return Err(RenpyExError::PathTraversal {
-                    archive: out_root.to_path_buf(),
-                    entry: rel.to_string(),
-                });
-            }
-            piece => joined.push(piece),
-        }
-    }
-    Ok(joined)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,14 +447,14 @@ mod tests {
     #[test]
     fn safe_join_rejects_traversal() {
         let root = Path::new("/out");
-        assert!(safe_join(root, "../etc/passwd").is_err());
-        assert!(safe_join(root, "a/../../b").is_err());
+        assert!(output::safe_join(root, "../etc/passwd").is_err());
+        assert!(output::safe_join(root, "a/../../b").is_err());
     }
 
     #[test]
     fn safe_join_accepts_normal_relative_path() {
         let root = Path::new("/out");
-        let joined = safe_join(root, "images/bg.png").unwrap();
+        let joined = output::safe_join(root, "images/bg.png").unwrap();
         assert_eq!(joined, Path::new("/out/images/bg.png"));
     }
 
@@ -403,5 +472,152 @@ mod tests {
     #[test]
     fn parse_user_key_rejects_non_hex() {
         assert!(parse_user_key(Some("nothex")).is_err());
+    }
+
+    #[test]
+    fn convert_rejects_destination_collision_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source).unwrap();
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([12, 34, 56]));
+        image
+            .save_with_format(source.join("same.png"), image::ImageFormat::Png)
+            .unwrap();
+        image
+            .save_with_format(source.join("same.jpg"), image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let error = convert(&source, &output, &OpSettings::default())
+            .expect_err("destination collision must fail");
+        assert!(error.to_string().contains("collision"), "{error}");
+        assert!(
+            !output.exists() || std::fs::read_dir(output).unwrap().next().is_none(),
+            "collision preflight left converted output"
+        );
+    }
+
+    #[test]
+    fn extract_without_unpacking_rpa_copies_archive_and_reports_exact_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source).unwrap();
+        let archive_bytes = b"RPA-3.0 opaque archive bytes";
+        std::fs::write(source.join("archive.rpa"), archive_bytes).unwrap();
+        let settings = OpSettings {
+            include_rpa: false,
+            ..OpSettings::default()
+        };
+
+        let log = extract(&source, &output, &settings).unwrap();
+
+        assert_eq!(
+            std::fs::read(output.join("archive.rpa")).unwrap(),
+            archive_bytes
+        );
+        let manifest = output.join("SHA256SUMS.txt");
+        let (verified, failures) = verify::verify_all(&output, &manifest).unwrap();
+        assert_eq!(verified, 1);
+        assert!(failures.is_empty());
+        assert!(log.contains("Done. Wrote 1 files."), "{log}");
+    }
+
+    #[test]
+    fn extract_rejects_source_manifest_collision_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("payload.txt"), b"payload").unwrap();
+        std::fs::write(source.join("SHA256SUMS.txt"), b"source manifest").unwrap();
+        let settings = OpSettings {
+            include_rpa: false,
+            ..OpSettings::default()
+        };
+
+        let error = extract(&source, &output, &settings)
+            .expect_err("source manifest collision must fail before output");
+
+        assert!(error.to_string().contains("collision"), "{error}");
+        assert!(
+            !output.exists() || std::fs::read_dir(output).unwrap().next().is_none(),
+            "manifest collision preflight left output"
+        );
+    }
+
+    #[test]
+    fn convert_rejects_invalid_persisted_jpeg_quality_before_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source).unwrap();
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([1, 2, 3]));
+        image
+            .save_with_format(source.join("image.png"), image::ImageFormat::Png)
+            .unwrap();
+        let settings = OpSettings {
+            convert_to: ConvertTarget::Jpeg,
+            jpeg_quality: 0,
+            ..OpSettings::default()
+        };
+
+        let error = convert(&source, &output, &settings).expect_err("quality 0 must fail");
+        assert!(error.to_string().contains("1..=100"), "{error}");
+        assert!(!output.exists(), "invalid settings created output");
+    }
+
+    #[test]
+    fn extract_returns_error_when_an_archive_cannot_be_unpacked() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("broken.rpa"), b"RPA-3.0 broken").unwrap();
+
+        let error = extract(&source, &output, &OpSettings::default())
+            .expect_err("partial extraction must fail the GUI operation");
+
+        let message = error.to_string();
+        assert!(message.contains("Done with 1 failures."), "{message}");
+        assert!(message.contains("broken.rpa"), "{message}");
+    }
+
+    #[test]
+    fn verify_returns_error_when_hash_does_not_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path();
+        std::fs::write(source.join("file.txt"), b"actual").unwrap();
+        std::fs::write(
+            source.join("SHA256SUMS.txt"),
+            format!("{}  file.txt\n", "0".repeat(64)),
+        )
+        .unwrap();
+
+        let error = verify(source, None).expect_err("hash mismatch must fail the GUI operation");
+
+        let message = error.to_string();
+        assert!(message.contains("Verified 0 / 1"), "{message}");
+        assert!(message.contains("MISMATCH"), "{message}");
+    }
+
+    #[test]
+    fn convert_returns_error_when_a_detected_image_cannot_be_decoded() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("truncated.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+
+        let error = convert(&source, &output, &OpSettings::default())
+            .expect_err("decode failure must fail the GUI operation");
+
+        let message = error.to_string();
+        assert!(message.contains("convert fail truncated.png"), "{message}");
+        assert!(message.contains("failed: 1"), "{message}");
     }
 }
