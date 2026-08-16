@@ -306,7 +306,13 @@ mod tests {
 
         let td = tempdir().unwrap();
         let name = OsString::from_vec(vec![b'f', 0x80]);
-        std::fs::write(td.path().join(&name), b"payload").unwrap();
+        // macOS APFS rejects file names that are not valid UTF-8 outright
+        // (EILSEQ); the byte-preserving semantics this test exercises are
+        // unreachable there, so skip instead of failing on creation.
+        if std::fs::write(td.path().join(&name), b"payload").is_err() {
+            eprintln!("skipped: filesystem rejects non-UTF-8 file names");
+            return;
+        }
 
         let inv = GameWalker::new(td.path().to_path_buf()).walk().unwrap();
         assert_eq!(inv.files.len(), 1);

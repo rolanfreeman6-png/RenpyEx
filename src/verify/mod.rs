@@ -598,7 +598,13 @@ mod tests {
 
         let td = tempdir().unwrap();
         let name = OsString::from_vec(vec![b'f', 0x80]);
-        std::fs::write(td.path().join(name), b"payload").unwrap();
+        // macOS APFS rejects file names that are not valid UTF-8 outright
+        // (EILSEQ); a manifest over such names is unreachable there, so skip
+        // instead of failing on creation.
+        if std::fs::write(td.path().join(&name), b"payload").is_err() {
+            eprintln!("skipped: filesystem rejects non-UTF-8 file names");
+            return;
+        }
         let sums = td.path().join("SHA256SUMS.txt");
         let error = emit_sums(td.path(), &sums).expect_err("non-UTF name must be diagnosed");
         assert!(error.to_string().contains("only UTF-8"), "{error}");
