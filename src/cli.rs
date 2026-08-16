@@ -298,6 +298,7 @@ fn cmd_sdk(project: &Path, sdk_dir: &Path, timeout: u64, command: SdkCommand) ->
 }
 
 fn cmd_info(dir: &Path) -> crate::Result<()> {
+    archive::walker::require_directory(dir)?;
     let game_dir = archive::walker::resolve_game_dir(dir);
     let inv = GameWalker::new(game_dir.clone()).walk()?;
     println!("Game directory: {}", game_dir.display());
@@ -322,13 +323,17 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
             {
                 rpa_found += 1;
                 println!("Archive detected: {}", file.rel.display());
-                if let Ok(listed) = list_rpa(&file.abs, None) {
-                    println!(
+                match list_rpa(&file.abs, None) {
+                    Ok(listed) => println!(
                         "  {} version, {} entries, {} bytes uncompressed",
                         listed.version,
                         listed.entries.len(),
                         listed.total_uncompressed
-                    );
+                    ),
+                    Err(error) => eprintln!(
+                        "  warning: could not inspect {}: {error}",
+                        file.rel.display()
+                    ),
                 }
             }
         }
@@ -340,6 +345,7 @@ fn cmd_info(dir: &Path) -> crate::Result<()> {
 }
 
 fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result<()> {
+    archive::walker::require_directory(dir)?;
     let game_dir = archive::walker::resolve_game_dir(dir);
     output::reject_output_within_source(&game_dir, out)?;
     let inv = GameWalker::new(game_dir.clone()).walk()?;
@@ -364,6 +370,20 @@ fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result
     } else {
         None
     };
+    if options.rpa && options.rpyc && has_rpa {
+        let archives: Vec<(PathBuf, PathBuf)> = inv
+            .files
+            .iter()
+            .filter(|file| {
+                file.rel
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rpa"))
+            })
+            .map(|file| (file.abs.clone(), file.rel.clone()))
+            .collect();
+        archive::rpyc::preflight_archive_decompilation(out, &archives, parsed_key)?;
+    }
     output::prepare_output(out, options.overwrite)?;
     println!(
         "Walking {} ({} files)…",
@@ -440,6 +460,25 @@ fn cmd_extract(dir: &Path, out: &Path, options: ExtractOptions) -> crate::Result
                 Err(e) => failures.push(format!("{}: {e}", file.rel.display())),
             }
         }
+        if options.rpa {
+            // Decompile scripts unpacked from archives, in place on the
+            // unpacked copies (the source game is never touched).
+            let mut unpacked_rpyc = Vec::new();
+            archive::rpyc::collect_rpyc_files(&out.join("rpa"), &mut unpacked_rpyc);
+            unpacked_rpyc.sort();
+            for rpyc_path in unpacked_rpyc {
+                match decompile_rpyc_to(&rpyc_path, &rpyc_path, &opts) {
+                    Ok(Some(rpy)) => {
+                        println!("Decompiled: {}", rpy.display());
+                    }
+                    Ok(None) => eprintln!(
+                        "Skipped (no unrpyc): {}",
+                        rpyc_path.strip_prefix(out).unwrap_or(&rpyc_path).display()
+                    ),
+                    Err(e) => failures.push(format!("{}: {e}", rpyc_path.display())),
+                }
+            }
+        }
     }
 
     if failures.is_empty() {
@@ -512,6 +551,7 @@ fn cmd_convert(
     quality: u8,
     overwrite: bool,
 ) -> crate::Result<()> {
+    archive::walker::require_directory(dir)?;
     let target = ConvertTarget::parse(to)
         .ok_or_else(|| crate::RenpyExError::Invalid(format!("invalid --to value: {to}")))?;
     let jpeg_quality = match target {

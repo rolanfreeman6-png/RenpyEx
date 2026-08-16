@@ -460,7 +460,13 @@ fn is_same_or_child(output: &Path, source: &Path) -> bool {
     output.starts_with(source)
 }
 
-fn absolute_lexical(path: &Path) -> Result<PathBuf> {
+/// Make `path` absolute against the process working directory and collapse
+/// `.`/`..` components lexically, without touching the filesystem.
+///
+/// Unlike [`Path::canonicalize`] this does not resolve symlinks and does not
+/// produce `\\?\` extended-length prefixes on Windows, so the result stays
+/// passable to external tools that expect ordinary paths.
+pub fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     let input = if path.is_absolute() {
         path.to_path_buf()
     } else {

@@ -67,6 +67,24 @@ pub fn resolve_game_dir(input: &Path) -> PathBuf {
     input.to_path_buf()
 }
 
+/// Reject non-directory inputs with an actionable message instead of a
+/// filesystem-specific walk error (e.g. Windows os error 267).
+pub fn require_directory(input: &Path) -> crate::Result<()> {
+    if input.is_dir() {
+        Ok(())
+    } else if input.exists() {
+        Err(RenpyExError::Invalid(format!(
+            "input path is a file, not a directory: {}",
+            input.display()
+        )))
+    } else {
+        Err(RenpyExError::Invalid(format!(
+            "input directory does not exist: {}",
+            input.display()
+        )))
+    }
+}
+
 /// Directory walker that produces an inventory.
 pub struct GameWalker {
     root: PathBuf,

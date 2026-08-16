@@ -758,7 +758,7 @@ fn parse_pickle_index(
     path: &Path,
 ) -> Result<Vec<RpaEntry>> {
     let script = r#"
-import io, json, pickle, sys, unicodedata
+import _codecs, io, json, pickle, sys, unicodedata
 
 max_paths = int(sys.argv[1])
 max_tuples = int(sys.argv[2])
@@ -768,6 +768,12 @@ data = sys.stdin.buffer.read()
 
 class SafeUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
+        # Pickle protocols < 4 represent `bytes` values through a
+        # `_codecs.encode(str, "latin1")` reduce. The allowlist entry is a
+        # stdlib str.encode wrapper with no code-execution capability; every
+        # other global remains rejected.
+        if module == "_codecs" and name == "encode":
+            return _codecs.encode
         raise pickle.UnpicklingError("global objects are not permitted")
 
 def decode_path(value):
@@ -1049,6 +1055,17 @@ elif mode == "legacy":
     assert len(header) == 24
     open(sys.argv[1], "wb").write(header + payload + zlib.compress(pickle_data))
     sys.exit(0)
+elif mode == "py2_bytes_prefix":
+    # Protocol 2 on Python 3 encodes the bytes prefix through the
+    # `_codecs.encode` global; the helper must accept exactly this global.
+    payload = b"tail"
+    key = 0x42424242
+    index = {"prefixed.bin": [(34 ^ key, len(payload) ^ key, b"head-")]}
+    pickle_data = pickle.dumps(index, protocol=2)
+    header = f"RPA-3.0 {34 + len(payload):016x} {key:08x}\n".encode("ascii")
+    assert len(header) == 34
+    open(sys.argv[1], "wb").write(header + payload + zlib.compress(pickle_data))
+    sys.exit(0)
 else:
     raise ValueError(mode)
 key = 0x42424242
@@ -1165,6 +1182,21 @@ open(sys.argv[1], "wb").write(header + body + zlib.compress(pickle.dumps(index, 
         let listed = list_rpa(&archive, None).unwrap();
         assert_eq!(listed.entries[0].path, "café.txt");
         assert_eq!(read_entry(&archive, &listed.entries[0]).unwrap(), b"legacy");
+    }
+
+    #[test]
+    fn protocol2_bytes_prefix_round_trips_through_codec_global() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("py2-prefix.rpa");
+        write_collision_archive(&archive, "py2_bytes_prefix");
+
+        let listed = list_rpa(&archive, None).unwrap();
+        assert_eq!(listed.entries[0].path, "prefixed.bin");
+        assert_eq!(
+            read_entry(&archive, &listed.entries[0]).unwrap(),
+            b"head-tail",
+            "protocol-2 bytes prefix must decode via the allowlisted codec global"
+        );
     }
 
     #[test]

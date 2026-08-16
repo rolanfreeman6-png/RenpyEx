@@ -13,5 +13,8 @@ pub use rpa::{
     Length, Offset, RpaEntry, RpaExtracted, RpaVersion, ensure_python_available, extract_rpa,
     list_rpa, read_entry,
 };
-pub use rpyc::{RpycDecompileOptions, decompile_rpyc, decompile_rpyc_to, find_unrpyc};
-pub use walker::{GameInventory, GameWalker};
+pub use rpyc::{
+    RpycDecompileOptions, collect_rpyc_files, decompile_rpyc, decompile_rpyc_to, find_unrpyc,
+    preflight_archive_decompilation,
+};
+pub use walker::{GameInventory, GameWalker, require_directory, resolve_game_dir};

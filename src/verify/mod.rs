@@ -252,10 +252,11 @@ fn magic_matches_extension(extension: &str, detected: Magic) -> bool {
 }
 
 fn validate_image_dimensions(path: &Path) -> std::result::Result<(), String> {
-    let reader = image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .map_err(|error| format!("cannot open image header: {error}"))?
         .with_guessed_format()
         .map_err(|error| format!("cannot identify image header: {error}"))?;
+    reader.limits(crate::convert::image::decode_limits());
     reader
         .into_dimensions()
         .map(|_| ())

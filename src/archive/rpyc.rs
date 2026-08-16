@@ -104,6 +104,79 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Recursively collect `.rpyc` files under `dir` into `out`.
+///
+/// A missing `dir` is not an error (nothing has been unpacked there yet).
+/// Callers sort the result for deterministic reporting.
+pub fn collect_rpyc_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_rpyc_files(&path, out);
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("rpyc")
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Preflight decompilation destinations for `.rpyc` entries inside archives
+/// that will be unpacked under `out_root/rpa/<archive rel>`.
+///
+/// Rejects, before any output is written, the case where a decompiled
+/// sidecar (`x.rpyc` → `x.rpy`) would collide with a file unpacked from the
+/// same archive, including case-insensitive and normalized aliases on
+/// Windows/macOS. Archives that cannot be listed are skipped here; the
+/// unpack step reports their failure.
+pub fn preflight_archive_decompilation(
+    out_root: &Path,
+    archives: &[(PathBuf, PathBuf)],
+    key: Option<u32>,
+) -> crate::Result<()> {
+    for (archive_abs, archive_rel) in archives {
+        let Ok(listed) = crate::archive::rpa::list_rpa(archive_abs, key) else {
+            continue;
+        };
+        let unpack_root = out_root.join("rpa").join(archive_rel);
+        let mut destinations = crate::output::DestinationRegistry::new(&unpack_root);
+        // Fragmented entries repeat a path; claim each unique path once.
+        let mut unique_paths = std::collections::BTreeSet::new();
+        for entry in &listed.entries {
+            unique_paths.insert(entry.path.clone());
+        }
+        for path in &unique_paths {
+            if path.ends_with(".rpyc") {
+                let sidecar = PathBuf::from(path).with_extension("rpy");
+                let sidecar_str = sidecar.to_string_lossy().into_owned();
+                let sidecar_path = crate::output::safe_join(&unpack_root, &sidecar_str)?;
+                destinations.claim(
+                    format!(
+                        "decompiled archive script {}/{}",
+                        archive_rel.display(),
+                        path
+                    ),
+                    &sidecar_path,
+                )?;
+            }
+        }
+        for path in &unique_paths {
+            let entry_path = crate::output::safe_join(&unpack_root, path)?;
+            destinations.claim(
+                format!("unpacked entry {}/{}", archive_rel.display(), path),
+                &entry_path,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Reject unsafe in-place decompilation.
 ///
 /// Use [`decompile_rpyc_to`] with a destination under the caller-controlled
@@ -127,6 +200,9 @@ pub fn decompile_rpyc(
 }
 
 /// Decompile a copied `.rpyc` into an output tree without modifying the source.
+///
+/// When `source` and `destination_rpyc` are the same path (decompiling an
+/// already-extracted copy in place), the copy step is skipped.
 pub fn decompile_rpyc_to(
     source: &Path,
     destination_rpyc: &Path,
@@ -141,7 +217,9 @@ pub fn decompile_rpyc_to(
             destination_rpyc.display()
         )));
     }
-    crate::output::copy_atomic(source, destination_rpyc)?;
+    if source != destination_rpyc {
+        crate::output::copy_atomic(source, destination_rpyc)?;
+    }
     let sidecar = destination_rpyc.with_extension("rpy");
     let (python, unrpyc) = match find_unrpyc(opts) {
         Some(value) => value,

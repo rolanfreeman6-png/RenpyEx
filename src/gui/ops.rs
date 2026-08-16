@@ -55,6 +55,7 @@ pub fn scan(source: &Path) -> Result<String> {
 
 pub(crate) fn scan_with_progress(source: &Path, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let mut log = String::new();
+    archive::walker::require_directory(source)?;
     let game_dir = archive::walker::resolve_game_dir(source);
     progress("walking source files");
     let inv = GameWalker::new(game_dir.clone()).walk()?;
@@ -83,14 +84,23 @@ pub(crate) fn scan_with_progress(source: &Path, progress: &mut dyn FnMut(&str)) 
             {
                 rpa_found += 1;
                 let _ = writeln!(log, "Archive detected: {}", file.rel.display());
-                if let Ok(listed) = list_rpa(&file.abs, None) {
-                    let _ = writeln!(
-                        log,
-                        "  {} version, {} entries, {} bytes uncompressed",
-                        listed.version,
-                        listed.entries.len(),
-                        listed.total_uncompressed
-                    );
+                match list_rpa(&file.abs, None) {
+                    Ok(listed) => {
+                        let _ = writeln!(
+                            log,
+                            "  {} version, {} entries, {} bytes uncompressed",
+                            listed.version,
+                            listed.entries.len(),
+                            listed.total_uncompressed
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            log,
+                            "  warning: could not inspect {}: {error}",
+                            file.rel.display()
+                        );
+                    }
                 }
             }
         }
@@ -116,6 +126,7 @@ pub(crate) fn extract_with_progress(
     progress: &mut dyn FnMut(&str),
 ) -> Result<String> {
     let mut log = String::new();
+    archive::walker::require_directory(source)?;
     let game_dir = archive::walker::resolve_game_dir(source);
     output::reject_output_within_source(&game_dir, output)?;
     progress("walking source files");
@@ -141,6 +152,20 @@ pub(crate) fn extract_with_progress(
     } else {
         None
     };
+    if settings.include_rpa && settings.decompile_rpyc && has_rpa {
+        let archives: Vec<(std::path::PathBuf, std::path::PathBuf)> = inv
+            .files
+            .iter()
+            .filter(|file| {
+                file.rel
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rpa"))
+            })
+            .map(|file| (file.abs.clone(), file.rel.clone()))
+            .collect();
+        crate::archive::rpyc::preflight_archive_decompilation(output, &archives, parsed_key)?;
+    }
     output::prepare_output(output, settings.overwrite)?;
     progress(&format!("copying {} files", inv.files.len()));
     let _ = writeln!(
@@ -227,6 +252,38 @@ pub(crate) fn extract_with_progress(
                     let _ = writeln!(log, "Skipped (no unrpyc): {}", file.rel.display());
                 }
                 Err(e) => failures.push(format!("{}: {e}", file.rel.display())),
+            }
+        }
+        if settings.include_rpa {
+            // Decompile scripts unpacked from archives, in place on the
+            // unpacked copies (the source game is never touched).
+            let mut unpacked_rpyc = Vec::new();
+            crate::archive::rpyc::collect_rpyc_files(&output.join("rpa"), &mut unpacked_rpyc);
+            unpacked_rpyc.sort();
+            for rpyc_path in unpacked_rpyc {
+                progress(&format!(
+                    "decompiling {}",
+                    rpyc_path
+                        .strip_prefix(output)
+                        .unwrap_or(&rpyc_path)
+                        .display()
+                ));
+                match decompile_rpyc_to(&rpyc_path, &rpyc_path, &opts) {
+                    Ok(Some(rpy)) => {
+                        let _ = writeln!(log, "Decompiled: {}", rpy.display());
+                    }
+                    Ok(None) => {
+                        let _ = writeln!(
+                            log,
+                            "Skipped (no unrpyc): {}",
+                            rpyc_path
+                                .strip_prefix(output)
+                                .unwrap_or(&rpyc_path)
+                                .display()
+                        );
+                    }
+                    Err(e) => failures.push(format!("{}: {e}", rpyc_path.display())),
+                }
             }
         }
     }
@@ -328,6 +385,7 @@ pub(crate) fn convert_with_progress(
     progress: &mut dyn FnMut(&str),
 ) -> Result<String> {
     let mut log = String::new();
+    crate::archive::walker::require_directory(source)?;
     let game_dir = archive::walker::resolve_game_dir(source);
     output::reject_output_within_source(&game_dir, output)?;
     progress("walking source files");

@@ -55,18 +55,31 @@ impl FormatQuality {
     }
 }
 
+/// RenpyEx decode policy: the maximum sum of decoder allocations for a
+/// single image. Set explicitly so behaviour does not silently change with
+/// the `image` crate's defaults; matches the historical default of 512 MiB.
+pub const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Build the decoder limits applied to every decode performed by RenpyEx.
+#[must_use]
+pub fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    limits
+}
+
 /// Read an input image and return a decoded `DynamicImage`. If decoding
 /// fails, report a [`RenpyExError::Image`] with the input path attached.
 pub fn ensure_decode(path: &Path) -> Result<image::DynamicImage> {
-    ImageReader::open(path)
+    let mut reader = ImageReader::open(path)
         .map_err(|e| RenpyExError::io(path, e))?
         .with_guessed_format()
-        .map_err(|e| RenpyExError::io(path, e))?
-        .decode()
-        .map_err(|e| RenpyExError::Image {
-            path: path.to_path_buf(),
-            message: format!("decode failed: {e}"),
-        })
+        .map_err(|e| RenpyExError::io(path, e))?;
+    reader.limits(decode_limits());
+    reader.decode().map_err(|e| RenpyExError::Image {
+        path: path.to_path_buf(),
+        message: format!("decode failed: {e}"),
+    })
 }
 
 /// Re-encode the supplied image bytes (PNG/JPEG/etc) to PNG.

@@ -79,6 +79,10 @@ renpyex doctor "C:/Games/MyVN" --json > doctor.json
 # Optional decompile into the output tree, never next to the source game
 renpyex extract "C:/Games/MyVN" --out ./extracted --rpyc --python python --unrpyc unrpyc.py
 
+# With both --rpa and --rpyc, scripts inside the unpacked archives are
+# decompiled too (sidecars collide-checked before anything is written)
+renpyex extract "C:/Games/MyVN" --out ./extracted --rpa --rpyc --unrpyc unrpyc.py
+
 # Run official Ren'Py lint without shell interpolation
 renpyex sdk "C:/Games/MyVN" --sdk "C:/renpy-sdk" lint --all-problems
 
@@ -197,7 +201,11 @@ magic → 16-hex offset → key → zlib-compressed pickled index).
 - Audio/video conversion — everything is copied through byte-perfect;
   `convert` only re-encodes images, and only when you ask it to
 - `.rpyc → .rpy` decompilation is delegated to Python
-  [`unrpyc`](https://github.com/CensoredUsername/unrpyc) when present
+  [`unrpyc`](https://github.com/CensoredUsername/unrpyc) when present. With
+  `extract --rpa --rpyc`, `.rpyc` entries inside the unpacked archives are
+  decompiled in place on the unpacked copies; a sidecar that would overwrite
+  a file unpacked from the same archive is rejected before any output is
+  written
 - Game-specific in-game decryption keys
 
 ## 📄 License

@@ -277,3 +277,218 @@ fn cli_extract_rejects_source_manifest_collision_before_writing() {
         "manifest collision preflight left output"
     );
 }
+
+/// Build an RPA-3.0 archive containing the requested entries under `path`.
+fn write_archive_with_entries(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write;
+    let script = r#"
+import pickle, sys, zlib
+entries = eval(sys.argv[2])
+key = 0x42424242
+offset = 34
+body = b""
+index = {}
+for name, payload in entries:
+    index[name] = [(offset ^ key, len(payload) ^ key)]
+    body += payload
+    offset += len(payload)
+header = f"RPA-3.0 {offset:016x} {key:08x}\n".encode("ascii")
+assert len(header) == 34
+open(sys.argv[1], "wb").write(header + body + zlib.compress(pickle.dumps(index, protocol=4)))
+"#;
+    // Render entries as Python source: ("name", bytes.fromhex("...")).
+    let mut payload = String::from("[");
+    for (name, bytes) in entries {
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        payload.push_str(&format!("({name:?}, bytes.fromhex(\"{hex}\")),"));
+    }
+    payload.push(']');
+    let status = Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .arg("-c")
+        .arg(script)
+        .arg(path)
+        .arg(payload)
+        .status()
+        .expect("launch Python archive builder");
+    assert!(status.success(), "Python archive builder failed");
+    let _ = std::io::stdout().flush();
+}
+
+/// Put a fake `unrpyc` on a PATH that is prepended to the child environment.
+fn fake_unrpyc_on_path(tmp: &std::path::Path) -> PathBuf {
+    let tools_dir = tmp.join("tools");
+    std::fs::create_dir(&tools_dir).unwrap();
+    #[cfg(windows)]
+    let tool_path = tools_dir.join("unrpyc.py");
+    #[cfg(not(windows))]
+    let tool_path = tools_dir.join("unrpyc");
+    let script = r#"#!/usr/bin/env python3
+from pathlib import Path
+import sys
+Path(sys.argv[-1]).with_suffix(".rpy").write_bytes(b"label fake_archive_script:\n    pass\n")
+"#;
+    std::fs::write(&tool_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&tool_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool_path, permissions).unwrap();
+    }
+    tools_dir
+}
+
+fn command_with_tool_path(tools_dir: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new(binary_path());
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut search_paths = vec![tools_dir.to_path_buf()];
+    search_paths.extend(std::env::split_paths(&existing_path));
+    command.env("PATH", std::env::join_paths(search_paths).unwrap());
+    #[cfg(windows)]
+    command.env("PATHEXT", ".PY;.EXE;.COM;.BAT;.CMD");
+    for arg in args {
+        command.arg(arg);
+    }
+    command
+}
+
+#[test]
+fn cli_extract_decompiles_rpyc_inside_unpacks_archives() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("game");
+    let output_dir = tmp.path().join("out");
+    std::fs::create_dir(&source).unwrap();
+    write_archive_with_entries(
+        &source.join("scripts.rpa"),
+        &[("script.rpyc", b"compiled-bytes")],
+    );
+
+    let tools_dir = fake_unrpyc_on_path(tmp.path());
+    let output = command_with_tool_path(
+        &tools_dir,
+        &[
+            "extract",
+            source.to_str().unwrap(),
+            "--out",
+            output_dir.to_str().unwrap(),
+            "--rpa",
+            "--rpyc",
+        ],
+    )
+    .output()
+    .expect("spawn renpyex");
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            output_dir
+                .join("rpa")
+                .join("scripts.rpa")
+                .join("script.rpy")
+        )
+        .unwrap(),
+        "label fake_archive_script:\n    pass\n",
+        "archive-internal .rpyc must be decompiled next to its unpacked copy"
+    );
+    // The unpacked .rpyc itself must still be present and untouched.
+    assert_eq!(
+        std::fs::read(
+            output_dir
+                .join("rpa")
+                .join("scripts.rpa")
+                .join("script.rpyc")
+        )
+        .unwrap(),
+        b"compiled-bytes"
+    );
+}
+
+#[test]
+fn cli_extract_rejects_archive_sidecar_collision_before_writing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("game");
+    let output_dir = tmp.path().join("out");
+    std::fs::create_dir(&source).unwrap();
+    write_archive_with_entries(
+        &source.join("scripts.rpa"),
+        &[
+            ("shared.rpy", b"original script\n"),
+            ("shared.rpyc", b"compiled bytes"),
+        ],
+    );
+
+    let tools_dir = fake_unrpyc_on_path(tmp.path());
+    let output = command_with_tool_path(
+        &tools_dir,
+        &[
+            "extract",
+            source.to_str().unwrap(),
+            "--out",
+            output_dir.to_str().unwrap(),
+            "--rpa",
+            "--rpyc",
+        ],
+    )
+    .output()
+    .expect("spawn renpyex");
+
+    assert!(
+        !output.status.success(),
+        "sidecar collision was accepted: stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("collision"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output_dir.exists() || std::fs::read_dir(&output_dir).unwrap().next().is_none(),
+        "sidecar collision preflight left output"
+    );
+}
+
+#[test]
+fn cli_info_reports_uninspectable_archive_on_stderr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("game");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("broken.rpa"), b"RPA-3.0 broken bytes").unwrap();
+
+    let output = Command::new(binary_path())
+        .arg("info")
+        .arg(&source)
+        .output()
+        .expect("spawn renpyex");
+
+    assert!(output.status.success(), "info stays read-only");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not inspect") && stderr.contains("broken.rpa"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn cli_extract_rejects_file_input_with_actionable_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file_input = tmp.path().join("game.rpa");
+    std::fs::write(&file_input, b"RPA-3.0 not a directory").unwrap();
+
+    let output = Command::new(binary_path())
+        .arg("extract")
+        .arg(&file_input)
+        .arg("--out")
+        .arg(tmp.path().join("out"))
+        .output()
+        .expect("spawn renpyex");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a directory"), "stderr={stderr}");
+}

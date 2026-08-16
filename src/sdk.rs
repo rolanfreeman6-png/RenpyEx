@@ -104,6 +104,11 @@ pub fn execute(spec: &Spec, project: &Path, action: &Action) -> Result<ResultInf
             project.display()
         )));
     }
+    // The SDK child runs with `current_dir(sdk_dir)`, so a project path
+    // relative to *our* working directory would resolve inside the SDK
+    // directory instead. Absolutize it lexically (no `\\?\` prefixes, so the
+    // path stays friendly to the SDK's own reporting).
+    let project = crate::output::absolute_lexical(project)?;
     let script = spec.sdk_dir.join("renpy.py");
     if !script.is_file() {
         return Err(RenpyExError::Invalid(format!(
@@ -122,7 +127,7 @@ pub fn execute(spec: &Spec, project: &Path, action: &Action) -> Result<ResultInf
             launcher.display()
         )));
     }
-    let mut command_args = action_arguments(project, action);
+    let mut command_args = action_arguments(&project, action);
     let args = if cfg!(windows) {
         let mut args = vec![script.to_string_lossy().into_owned()];
         args.append(&mut command_args);
@@ -174,12 +179,32 @@ pub fn execute(spec: &Spec, project: &Path, action: &Action) -> Result<ResultInf
         arguments: args,
     };
     if !status.success() {
+        // SDK tools (e.g. lint) write their diagnostics to stdout while still
+        // exiting non-zero; include a bounded excerpt of both streams so the
+        // failure is diagnosable from the error alone.
+        const MAX_STREAM_EXCERPT_CHARS: usize = 4096;
         return Err(RenpyExError::External {
             tool: "renpy-sdk".into(),
-            message: format!("exit={:?}\n{}", result.exit_code, result.stderr),
+            message: format!(
+                "exit={:?}\nstderr:\n{}\nstdout (first {MAX_STREAM_EXCERPT_CHARS} chars):\n{}",
+                result.exit_code,
+                truncate_chars(&result.stderr, MAX_STREAM_EXCERPT_CHARS),
+                truncate_chars(&result.stdout, MAX_STREAM_EXCERPT_CHARS),
+            ),
         });
     }
     Ok(result)
+}
+
+/// Truncate `text` to at most `limit` characters on a char boundary,
+/// appending an ellipsis marker when truncation occurred.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push_str("…[truncated]");
+    out
 }
 
 fn drain_timed_out_readers(
@@ -456,6 +481,64 @@ mod tests {
     fn lint_args_are_deterministic() {
         let a = action_arguments(Path::new("project"), &Action::Lint { all_problems: true });
         assert_eq!(a, ["project", "lint", "--error-code", "--all-problems"])
+    }
+
+    #[test]
+    fn relative_project_path_is_absolutized_against_process_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk_dir = temp.path().join("sdk");
+        create_fake_sdk(
+            &sdk_dir,
+            "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+        );
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = execute(
+            &Spec {
+                sdk_dir,
+                timeout: Duration::from_secs(10),
+            },
+            Path::new("."),
+            &Action::Lint {
+                all_problems: false,
+            },
+        )
+        .unwrap();
+
+        let received: Vec<String> = serde_json::from_str(result.stdout.trim()).unwrap();
+        assert_eq!(
+            Path::new(&received[0]),
+            cwd,
+            "relative project path must be absolutized before spawning the SDK child"
+        );
+    }
+
+    #[test]
+    fn failure_message_includes_stdout_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk_dir = temp.path().join("sdk");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        create_fake_sdk(
+            &sdk_dir,
+            "import sys\nprint('lint diagnostic on stdout')\nsys.stderr.write('stderr detail\\n')\nsys.exit(1)\n",
+        );
+
+        let error = execute(
+            &Spec {
+                sdk_dir,
+                timeout: Duration::from_secs(10),
+            },
+            &project,
+            &Action::Lint {
+                all_problems: false,
+            },
+        )
+        .expect_err("SDK failure must propagate");
+
+        let message = error.to_string();
+        assert!(message.contains("lint diagnostic on stdout"), "{message}");
+        assert!(message.contains("stderr detail"), "{message}");
     }
 
     #[test]
