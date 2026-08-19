@@ -1,6 +1,6 @@
 [package]
 name = "renpyex"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Ren'Py archive extractor with byte-perfect extraction and integrity verification"
@@ -25,7 +25,7 @@ name = "renpyex"
 path = "src/lib.rs"
 
 [features]
-gui = ["dep:egui", "dep:eframe", "dep:rfd", "dep:raw-window-handle", "dep:windows-sys"]
+gui = ["dep:egui", "dep:eframe", "dep:rfd", "dep:raw-window-handle", "dep:windows-sys", "dep:ureq"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -39,9 +39,11 @@ egui = { version = "0.36", optional = true }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"], optional = true }
 rfd = { version = "0.17.2", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+# HTTPS client for the GUI's star-gate GitHub API check (rustls, no native deps).
+ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"], optional = true }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

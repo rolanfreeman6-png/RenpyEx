@@ -56,6 +56,34 @@ fn make_window_translucent(frame: &eframe::Frame) {
 #[cfg(not(windows))]
 fn make_window_translucent(_frame: &eframe::Frame) {}
 
+/// Open a URL in the default browser via the shell.
+///
+/// Isolated `unsafe` (the library forbids it, the binary allows narrow
+/// scopes): a plain "open this URL" shell verb on a no-owner window — no
+/// memory safety concerns beyond NUL-terminated UTF-16 buffers.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn open_url_windows(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: standard shell "open" of a URL with no owner window; both
+    // string pointers point at NUL-terminated UTF-16 buffers that outlive
+    // the call.
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 /// Wrapper that applies the layered-window style once on the first frame —
 /// the HWND doesn't exist yet in the creation closure, so it can't be done
 /// there.
@@ -83,6 +111,11 @@ impl eframe::App for TranslucentApp {
 }
 
 fn main() {
+    // Browser opening via ShellExecuteW: the egui viewport route proved
+    // unreliable from the borderless layered window.
+    #[cfg(windows)]
+    renpyex::gui::set_url_opener(open_url_windows);
+
     let probe = std::env::args().any(|a| a == "--probe");
     if probe {
         let app = RenpyExApp::new();

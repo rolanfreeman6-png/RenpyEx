@@ -7,6 +7,7 @@
 pub mod app;
 pub mod config;
 pub mod ops;
+pub mod star_gate;
 pub mod theme;
 
-pub use app::RenpyExApp;
+pub use app::{set_url_opener, RenpyExApp};

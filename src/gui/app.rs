@@ -17,6 +17,7 @@ use std::sync::mpsc::Receiver;
 use crate::convert::ConvertTarget;
 use crate::gui::config::Config;
 use crate::gui::ops::{self, OpSettings};
+use crate::gui::star_gate::{self, GateEvent};
 use crate::gui::theme;
 
 /// Which operation a background job was running (for status messages).
@@ -60,6 +61,17 @@ enum JobEvent {
     Finished(JobResult),
 }
 
+/// Star-gate wizard step currently shown to the user.
+#[derive(Clone)]
+enum GateStage {
+    /// Initial explanation + "Sign in with GitHub" button.
+    Intro,
+    /// Device code issued; waiting for the user to authorize in the browser.
+    AwaitingDevice(star_gate::DeviceLogin),
+    /// Signed in, but the account has no star yet ("star + check again").
+    SignedIn(String),
+}
+
 /// The eframe application state.
 pub struct RenpyExApp {
     /// Source (game) directory as typed / picked.
@@ -76,6 +88,22 @@ pub struct RenpyExApp {
     pub running: Option<Job>,
     /// Whether an external Python `unrpyc` was detected at startup.
     pub python_available: bool,
+
+    /// GitHub username that passed the star gate, persisted to the config so
+    /// subsequent launches skip the gate entirely (offline-friendly).
+    starred_by: Option<String>,
+    /// Which step of the sign-in gate the user is on.
+    gate_stage: GateStage,
+    /// Human-readable gate error/hint (`None` = nothing to complain about).
+    gate_message: Option<String>,
+    /// Whether the device code was just copied (flips the button label to
+    /// "Copied ✓" for feedback). Reset when a new code arrives.
+    gate_code_copied: bool,
+    /// Device-flow token of the signed-in account (memory only, never saved
+    /// to disk). Kept so "check again" can re-query after the user stars.
+    gate_token: Option<String>,
+    /// Receiver for an in-flight gate worker, if any.
+    gate_rx: Option<Receiver<GateEvent>>,
 
     /// Receiver for background job results (present only while a job runs).
     rx: Option<Receiver<JobEvent>>,
@@ -106,6 +134,12 @@ impl Default for RenpyExApp {
             status: "ready".to_string(),
             running: None,
             python_available,
+            starred_by: cfg.starred_by,
+            gate_stage: GateStage::Intro,
+            gate_message: None,
+            gate_code_copied: false,
+            gate_token: None,
+            gate_rx: None,
             rx: None,
             log_cache: None,
             portrait: None,
@@ -121,13 +155,96 @@ impl RenpyExApp {
         Self::default()
     }
 
-    /// Persist the current source/output paths, ignoring errors.
+    /// Persist the current source/output paths (and star-gate activation),
+    /// ignoring errors.
     pub fn persist(&self) {
         let cfg = Config {
             last_source: self.source.clone(),
             last_output: self.output.clone(),
+            starred_by: self.starred_by.clone(),
         };
         let _ = cfg.save();
+    }
+
+    /// Whether the star gate still blocks the main UI.
+    fn gate_locked(&self) -> bool {
+        self.starred_by.is_none()
+    }
+
+    /// Start the device-flow sign-in on a worker thread. No-op if one is
+    /// already in flight.
+    fn start_device_flow(&mut self) {
+        if self.gate_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gate_rx = Some(rx);
+        self.gate_stage = GateStage::Intro;
+        self.gate_message = None;
+        self.status = "waiting for GitHub sign-in…".to_string();
+        std::thread::spawn(move || star_gate::run_device_flow(&tx));
+    }
+
+    /// Re-check the star with the token of the already signed-in account
+    /// (the user pressed "check again" after starring).
+    fn start_star_recheck(&mut self) {
+        if self.gate_rx.is_some() {
+            return;
+        }
+        let Some(token) = self.gate_token.clone() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gate_rx = Some(rx);
+        self.status = "checking star…".to_string();
+        std::thread::spawn(move || star_gate::recheck_star(&token, &tx));
+    }
+
+    /// Drain events from an in-flight gate worker. On success, persist the
+    /// activation so the gate never shows again for this user.
+    fn poll_gate(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.gate_rx.as_ref() else { return };
+        let event = match rx.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => return,
+            // Worker panicked before sending: recover to a clickable state.
+            Err(TryRecvError::Disconnected) => {
+                self.gate_rx = None;
+                self.gate_message =
+                    Some("sign-in terminated unexpectedly — try again".to_string());
+                self.gate_stage = GateStage::Intro;
+                return;
+            }
+        };
+        match event {
+            GateEvent::DeviceCode(login) => {
+                self.gate_stage = GateStage::AwaitingDevice(login);
+                self.gate_code_copied = false;
+            }
+            GateEvent::Authorized { login, token } => {
+                self.gate_token = Some(token);
+                self.status = format!("signed in as @{login}");
+            }
+            GateEvent::Starred(login) => {
+                self.gate_rx = None;
+                self.starred_by = Some(login);
+                self.gate_token = None;
+                self.status = "ready".to_string();
+                self.persist();
+            }
+            GateEvent::NotStarred(login) => {
+                self.gate_rx = None;
+                self.gate_stage = GateStage::SignedIn(login);
+            }
+            GateEvent::Denied(message) | GateEvent::Failed(message) => {
+                self.gate_rx = None;
+                self.gate_stage = GateStage::Intro;
+                self.gate_token = None;
+                self.gate_message = Some(message);
+                self.status = "star gate: sign-in failed".to_string();
+            }
+        }
     }
 
     /// Append a line to the log pane.
@@ -275,13 +392,18 @@ impl eframe::App for RenpyExApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_gate();
 
-        if self.running.is_some() {
+        if self.running.is_some() || self.gate_rx.is_some() {
             ctx.request_repaint();
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.gate_locked() {
+            self.gate_ui(ui);
+            return;
+        }
         let busy = self.running.is_some();
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -468,6 +590,265 @@ impl RenpyExApp {
                 egui::Slider::new(&mut self.settings.jpeg_quality, 1..=100).text("JPEG quality"),
             );
         }
+    }
+
+    /// First-launch star gate: the only screen shown until the user signs in
+    /// with GitHub and the signed-in account is verified to star this
+    /// repository. No username is typed — identity comes from the browser
+    /// sign-in, so nobody can pass with someone else's nickname.
+    fn gate_ui(&mut self, ui: &mut egui::Ui) {
+        // Borderless window: replicate the toolbar's drag strip + close button
+        // so the gate screen can still be moved and dismissed.
+        egui::Panel::top("gate-titlebar").show(ui, |ui| {
+            let bar_rect = egui::Rect::from_min_size(
+                ui.max_rect().min,
+                egui::vec2(ui.available_width(), 36.0),
+            );
+            let bar_resp = ui.interact(
+                bar_rect,
+                egui::Id::new("gate-drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if bar_resp.drag_started_by(egui::PointerButton::Primary) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("* RENPYEX *")
+                        .heading()
+                        .strong()
+                        .color(theme::ACCENT),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("unlock")
+                        .italics()
+                        .color(theme::LOG_MUTED),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::steel_button(ui, "❌").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("★ Support RenpyEx ★")
+                        .heading()
+                        .strong()
+                        .color(theme::ACCENT),
+                );
+            });
+            ui.add_space(12.0);
+            let busy = self.gate_rx.is_some();
+
+            match self.gate_stage.clone() {
+                GateStage::Intro => {
+                    ui.label(egui::RichText::new(
+                        "RenpyEx is free and open source. To unlock the GUI, sign in with GitHub and star ★ the project.",
+                    ).color(theme::FG));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(
+                        "Just press the button — it guides you through 3 easy steps. No password is entered in this app.",
+                    ).italics().color(theme::LOG_MUTED));
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(
+                                    egui::RichText::new("Sign in with GitHub  ★")
+                                        .strong()
+                                        .color(theme::ACCENT),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.start_device_flow();
+                        }
+                    });
+                }
+                GateStage::AwaitingDevice(login) => {
+                    ui.label(
+                        egui::RichText::new("STEP 1 of 3")
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                    ui.label(egui::RichText::new(
+                        "Press this button — a GitHub page opens in your browser:",
+                    )
+                    .color(theme::FG));
+                    ui.vertical_centered(|ui| {
+                        if theme::steel_button(ui, "Open GitHub sign-in page  ⤴").clicked() {
+                            open_in_browser(ui.ctx(), &login.verification_uri);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "(browser did not open? type this address manually: {})",
+                                login.verification_uri
+                            ))
+                            .weak()
+                            .color(theme::LOG_MUTED),
+                        );
+                    });
+                    ui.add_space(10.0);
+
+                    ui.label(
+                        egui::RichText::new("STEP 2 of 3")
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                    ui.label(egui::RichText::new(
+                        "Copy the code, paste it on that page (Ctrl+V) and press Continue:",
+                    )
+                    .color(theme::FG));
+                    ui.horizontal(|ui| {
+                        ui.add_space(24.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&login.user_code)
+                                    .monospace()
+                                    .size(30.0)
+                                    .strong()
+                                    .color(theme::ACCENT),
+                            )
+                            .selectable(true),
+                        );
+                        let copy_label = if self.gate_code_copied {
+                            "Copied ✓"
+                        } else {
+                            "Copy code"
+                        };
+                        if theme::steel_button(ui, copy_label).clicked() {
+                            ui.ctx().copy_text(login.user_code.clone());
+                            self.gate_code_copied = true;
+                        }
+                    });
+                    ui.add_space(10.0);
+
+                    ui.label(
+                        egui::RichText::new("STEP 3 of 3")
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                    ui.label(egui::RichText::new(
+                        "Press the green “Authorize RenpyEx” button in the browser.",
+                    )
+                    .color(theme::FG));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(
+                                "waiting for you to finish… (the code works for ~15 minutes)",
+                            )
+                            .italics()
+                            .color(theme::LOG_MUTED),
+                        );
+                    });
+                }
+                GateStage::SignedIn(refresh_login) => {
+                    ui.label(
+                        egui::RichText::new(format!("Signed in as @{refresh_login} ✓ — one last thing:"))
+                            .strong()
+                            .color(theme::LOG_OK),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("STEP 1 of 2")
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                    ui.label(egui::RichText::new(
+                        "Press this button and confirm the ★ star on the page (you are already logged in there):",
+                    )
+                    .color(theme::FG));
+                    ui.add_space(6.0);
+                    self.repo_link(ui);
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("STEP 2 of 2")
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                    ui.label(egui::RichText::new("Come back and press:").color(theme::FG));
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(
+                                    egui::RichText::new("Check again  ★").color(theme::FG),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.start_star_recheck();
+                        }
+                        if busy {
+                            ui.spinner();
+                        }
+                        ui.add_space(8.0);
+                        if theme::steel_button(ui, "Use a different account").clicked() {
+                            self.gate_token = None;
+                            self.gate_stage = GateStage::Intro;
+                        }
+                    });
+                }
+            }
+
+            if let Some(message) = self.gate_message.clone() {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!("⚠ {message}")).color(theme::LOG_ERR),
+                );
+            }
+        });
+    }
+
+    /// Clickable button that opens the repository in the browser (stars are
+    /// pressed there). Uses the same steel-button widget as the toolbar so
+    /// the click affordance matches the rest of the GUI.
+    fn repo_link(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            if theme::steel_button(ui, "★ Star on GitHub").clicked() {
+                open_in_browser(ui.ctx(), star_gate::REPO_URL);
+            }
+            ui.label(
+                egui::RichText::new(star_gate::REPO_URL)
+                    .monospace()
+                    .weak()
+                    .color(theme::LOG_MUTED),
+            );
+        });
+    }
+}
+
+/// Platform URL opener installed by the binary. The library forbids
+/// `unsafe`, so the Windows `ShellExecuteW` path lives in `src/bin/gui.rs`
+/// (next to the other Win32 calls) and registers itself here at startup.
+static URL_OPENER: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Install the platform URL opener. Call once from the binary before the UI
+/// loop starts; without one, egui's built-in `open_url` is used.
+pub fn set_url_opener(opener: fn(&str)) {
+    let _ = URL_OPENER.set(opener);
+}
+
+/// Open a URL in the system browser. Prefers the binary's installed opener
+/// (on Windows: `ShellExecuteW`, because the egui `ViewportCommand::OpenUrl`
+/// route proved unreliable from this borderless layered window); falls back
+/// to egui's built-in open.
+fn open_in_browser(ctx: &egui::Context, url: &str) {
+    if let Some(opener) = URL_OPENER.get() {
+        opener(url);
+    } else {
+        ctx.open_url(egui::OpenUrl::new_tab(url.to_string()));
     }
 }
 

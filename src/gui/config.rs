@@ -18,6 +18,11 @@ pub struct Config {
     /// Last-used output directory.
     #[serde(default)]
     pub last_output: String,
+    /// GitHub username whose star unlocked the GUI star gate, if it was
+    /// already passed. Presence alone unlocks the GUI — no re-check on
+    /// subsequent launches, so offline starts keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starred_by: Option<String>,
 }
 
 impl Config {
@@ -71,10 +76,16 @@ mod tests {
         let cfg = Config {
             last_source: "C:/games/foo".to_string(),
             last_output: "C:/out/foo".to_string(),
+            starred_by: Some("octocat".to_string()),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_source, cfg.last_source);
         assert_eq!(back.last_output, cfg.last_output);
+        assert_eq!(back.starred_by.as_deref(), Some("octocat"));
+        // Old configs without the field still parse (gate re-arms).
+        let legacy = r#"{"last_source":"a","last_output":"b"}"#;
+        let old: Config = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.starred_by, None);
     }
 }
